@@ -60,6 +60,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private var activeStreamEndpoint: UsbEndpoint? = null
     private val streamReaderRunning = AtomicBoolean(false)
     private var streamReaderThread: Thread? = null
+    private val panDeadzone = 0.08f
+    private val tiltDeadzone = 0.08f
+    private var currentPanAbs = 0
+    private var currentTiltAbs = 0
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
     private var cameraDevice: CameraDevice? = null
@@ -67,9 +71,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private var imageReader: ImageReader? = null
     private var cameraFramesSinceReport = 0L
     private var cameraLastReportMs = 0L
+    private var autoReconnectEnabled = true
+    private var lastTargetVid = -1
+    private var lastTargetPid = -1
 
     private external fun nativeInit(): Boolean
     private external fun nativeAttachUsbFd(fd: Int, vid: Int, pid: Int): Boolean
+    private external fun nativeActivateCamera(): Boolean
     private external fun nativeDetachUsb(): Boolean
     private external fun nativeStartTracking(): Boolean
     private external fun nativeStopTracking(): Boolean
@@ -106,6 +114,44 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             }
         }
 
+    private val usbAttachReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val action = intent?.action ?: return
+                @Suppress("DEPRECATION")
+                val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
+                if (action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
+                    val cur = usbDevice
+                    if (cur != null && cur.vendorId == device.vendorId && cur.productId == device.productId) {
+                        dispatchNativeEvent(
+                            "state",
+                            """{"status":"ready","message":"USB camera detached. Waiting for reconnect..."}""",
+                        )
+                        stopAndDetachUsb()
+                    }
+                    return
+                }
+                if (action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+                    if (!autoReconnectEnabled || !isLikelyUvcDevice(device)) {
+                        return
+                    }
+                    val targetMatch =
+                        (lastTargetVid < 0 || lastTargetPid < 0) ||
+                            (device.vendorId == lastTargetVid && device.productId == lastTargetPid)
+                    if (!targetMatch) {
+                        return
+                    }
+                    dispatchNativeEvent(
+                        "state",
+                        """{"status":"ready","message":"UVC camera attached. Auto-reconnecting..."}""",
+                    )
+                    mainHandler.postDelayed({
+                        connectUsbDevice(device.vendorId, device.productId)
+                    }, 400)
+                }
+            }
+        }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
@@ -119,8 +165,23 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                 IntentFilter(usbPermissionAction),
                 Context.RECEIVER_NOT_EXPORTED,
             )
+            registerReceiver(
+                usbAttachReceiver,
+                IntentFilter().apply {
+                    addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+                    addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+                },
+                Context.RECEIVER_NOT_EXPORTED,
+            )
         } else {
             registerReceiver(usbPermissionReceiver, IntentFilter(usbPermissionAction))
+            registerReceiver(
+                usbAttachReceiver,
+                IntentFilter().apply {
+                    addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+                    addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+                },
+            )
         }
         instance = this
         handleAdbControlIntent(intent)
@@ -136,6 +197,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         stopAndDetachUsb()
         nativeDispose()
         unregisterReceiver(usbPermissionReceiver)
+        unregisterReceiver(usbAttachReceiver)
         instance = null
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
@@ -188,12 +250,19 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                     result.success(false)
                     return
                 }
-                val ok = sendManualGimbalCommand(pan, tilt, durationMs)
+                val isCenter = isCenterCommand(pan, tilt)
+                if (isCenter) {
+                    currentPanAbs = 0
+                    currentTiltAbs = 0
+                }
+                val ok = sendManualGimbalCommand(pan, tilt, durationMs, force = isCenter)
                 nativeManualControl(pan, tilt, durationMs)
                 result.success(ok)
             }
 
             "activateCamera" -> result.success(activateCameraStreamInterface())
+            "activateCamera2" -> result.success(activateCameraWithCamera2())
+            "reconnect" -> result.success(reconnectLastDevice())
 
             "dispose" -> {
                 stopAndDetachUsb()
@@ -232,6 +301,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     }
 
     private fun connectUsbDevice(vid: Int, pid: Int): Boolean {
+        lastTargetVid = vid
+        lastTargetPid = pid
         if (!ensureCameraPermission()) {
             dispatchNativeEvent(
                 "state",
@@ -287,9 +358,26 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         usbDevice = device
         usbConnection = connection
         isCameraActive = false
+        currentPanAbs = 0
+        currentTiltAbs = 0
         Log.i(tag, "connectUsbDevice: connected vid=$vid pid=$pid fd=${connection.fileDescriptor}")
         dispatchNativeEvent("state", """{"status":"connected","message":"USB device connected."}""")
         return true
+    }
+
+    private fun reconnectLastDevice(): Boolean {
+        if (lastTargetVid < 0 || lastTargetPid < 0) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"No previous target device to reconnect."}""",
+            )
+            return false
+        }
+        dispatchNativeEvent(
+            "state",
+            """{"status":"ready","message":"Reconnecting to $lastTargetVid:$lastTargetPid..."}""",
+        )
+        return connectUsbDevice(lastTargetVid, lastTargetPid)
     }
 
     private fun ensureUsbPermission(device: UsbDevice): Boolean {
@@ -365,6 +453,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     }
 
     private fun stopAndDetachUsb() {
+        stopCamera2Pipeline()
         stopStreamReader()
         nativeStopTracking()
         nativeDetachUsb()
@@ -374,6 +463,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         usbDevice = null
         activeStreamEndpoint = null
         isCameraActive = false
+        currentPanAbs = 0
+        currentTiltAbs = 0
     }
 
     private fun handleAdbControlIntent(incoming: Intent?) {
@@ -412,132 +503,549 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                 if (!isCameraActive && !activateCameraStreamInterface()) {
                     return
                 }
-                sendManualGimbalCommand(pan, tilt, durationMs)
+                val isCenter = isCenterCommand(pan, tilt)
+                if (isCenter) {
+                    currentPanAbs = 0
+                    currentTiltAbs = 0
+                }
+                sendManualGimbalCommand(pan, tilt, durationMs, force = isCenter)
                 nativeManualControl(pan, tilt, durationMs)
             }
 
             "activate" -> activateCameraStreamInterface()
+            "activate2" -> activateCameraWithCamera2()
+            "probeptz" -> runPtzProbeSweep()
+            "dumpxu" -> dumpExtensionUnits()
+            "probexu" -> runXuProbeSweep()
+            "replaylinux" -> replayLinuxBaselinePtz()
         }
     }
 
-    private fun activateCameraStreamInterface(): Boolean {
+    private fun replayLinuxBaselinePtz() {
+        val connection = usbConnection
+        if (connection == null) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"No USB connection. Connect first, then replaylinux."}""",
+            )
+            return
+        }
+        val requestType = 0x21
+        val request = 0x01
+        val value = 0x0D00
+        val index = 0x0100
+        val timeoutMs = 1000
+        val packets =
+            listOf(
+                byteArrayOf(0x90.toByte(), 0x5f, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00), // pan +90000
+                byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00), // center
+                byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x30, 0x0b, 0x01, 0x00), // tilt +68400
+                byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00), // center
+            )
+        thread(name = "ReplayLinuxPTZ", isDaemon = true) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"Replaying Linux baseline PTZ sequence..."}""",
+            )
+            for (packet in packets) {
+                val sent =
+                    connection.controlTransfer(
+                        requestType,
+                        request,
+                        value,
+                        index,
+                        packet,
+                        packet.size,
+                        timeoutMs,
+                    )
+                Log.i(tag, "replaylinux: sent=$sent packet=${packet.joinToString("") { "%02x".format(it) }}")
+                Thread.sleep(250)
+            }
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"Linux baseline PTZ replay done."}""",
+            )
+        }
+    }
+
+    private data class XuUnit(val unitId: Int, val bmControls: ByteArray, val guid: String)
+
+    private fun parseExtensionUnitsFromRaw(raw: ByteArray): List<XuUnit> {
+        val out = mutableListOf<XuUnit>()
+        var i = 0
+        while (i + 2 < raw.size) {
+            val len = raw[i].toInt() and 0xFF
+            if (len <= 0 || i + len > raw.size) {
+                break
+            }
+            val dtype = raw[i + 1].toInt() and 0xFF
+            val subtype = if (len >= 3) (raw[i + 2].toInt() and 0xFF) else -1
+            if (dtype == 0x24 && subtype == 0x06 && len >= 24) {
+                val unitId = raw[i + 3].toInt() and 0xFF
+                val guidBytes = raw.copyOfRange(i + 4, i + 20)
+                val guid = guidBytes.joinToString("") { "%02X".format(it.toInt() and 0xFF) }
+                val numPins = raw[i + 21].toInt() and 0xFF
+                val ctrlSizeIndex = i + 22 + numPins
+                val ctrlSize = if (ctrlSizeIndex < i + len) (raw[ctrlSizeIndex].toInt() and 0xFF) else 0
+                val ctrlStart = ctrlSizeIndex + 1
+                val ctrlEnd = (ctrlStart + ctrlSize).coerceAtMost(i + len)
+                val bm = if (ctrlStart < ctrlEnd) raw.copyOfRange(ctrlStart, ctrlEnd) else ByteArray(0)
+                out.add(XuUnit(unitId, bm, guid))
+            }
+            i += len
+        }
+        return out
+    }
+
+    private fun dumpExtensionUnits() {
+        val connection = usbConnection
+        if (connection == null) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"No USB connection. Connect first, then dumpxu."}""",
+            )
+            return
+        }
+        val raw = connection.rawDescriptors
+        if (raw == null || raw.isEmpty()) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"No raw USB descriptors available."}""",
+            )
+            return
+        }
+        val units = parseExtensionUnitsFromRaw(raw)
+        if (units.isEmpty()) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"No XU descriptors found in raw descriptors."}""",
+            )
+            return
+        }
+        for (u in units) {
+            val bmHex = u.bmControls.joinToString("") { "%02X".format(it.toInt() and 0xFF) }
+                Log.i(
+                    tag,
+                    "XU unit=${u.unitId} guid=${u.guid} ctrlSize=${u.bmControls.size} bmControls=$bmHex",
+                )
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"ready","message":"XU unit=${u.unitId} guid=${u.guid} ctrlSize=${u.bmControls.size} bm=$bmHex"}""",
+                )
+        }
+        dispatchNativeEvent(
+            "state",
+            """{"status":"ready","message":"dumpxu done. Found ${units.size} extension unit(s)."}""",
+        )
+    }
+
+    private fun runXuProbeSweep() {
         val connection = usbConnection
         val device = usbDevice
         if (connection == null || device == null) {
             dispatchNativeEvent(
                 "state",
-                """{"status":"error","message":"No USB connection. Run connect first."}""",
+                """{"status":"error","message":"No USB connection. Connect first, then probexu."}""",
             )
-            return false
+            return
         }
-
-        val vsInterfaces =
-            (0 until device.interfaceCount)
-                .map { device.getInterface(it) }
-                .filter {
-                    it.interfaceClass == UsbConstants.USB_CLASS_VIDEO && it.interfaceSubclass == 2
-                }
-        for (intf in vsInterfaces) {
-            val eps =
-                (0 until intf.endpointCount).joinToString(";") { ei ->
-                    val ep = intf.getEndpoint(ei)
-                    "addr=${ep.address},type=${ep.type},dir=${ep.direction},mps=${ep.maxPacketSize}"
-                }
-            Log.i(
-                tag,
-                "activateCamera: vs intf id=${intf.id} alt=${intf.alternateSetting} eps=${intf.endpointCount} [$eps]",
-            )
-        }
-        if (vsInterfaces.isEmpty()) {
-            isCameraActive = false
+        val vcInterface = findVideoControlInterfaceNumber(device)
+        if (vcInterface < 0) {
             dispatchNativeEvent(
                 "state",
-                """{"status":"error","message":"No UVC VS interfaces found."}""",
+                """{"status":"error","message":"No VC interface found for XU probe."}""",
             )
-            return false
+            return
         }
-
-        val controlAlt =
-            vsInterfaces.firstOrNull { it.endpointCount == 0 } ?: vsInterfaces.first()
-        val vsInterfaceId = controlAlt.id
-        val (formatIndex, frameIndex, frameInterval100ns) = chooseStreamParams(connection)
-        Log.i(
-            tag,
-            "activateCamera: stream params format=$formatIndex frame=$frameIndex interval100ns=$frameInterval100ns",
-        )
-
-        val probeData = uvcProbeCommit(connection, vsInterfaceId, formatIndex, frameIndex, frameInterval100ns)
-        if (probeData == null) {
-            isCameraActive = false
+        val raw = connection.rawDescriptors ?: ByteArray(0)
+        val units = parseExtensionUnitsFromRaw(raw)
+        if (units.isEmpty()) {
             dispatchNativeEvent(
                 "state",
-                """{"status":"error","message":"UVC PROBE/COMMIT failed."}""",
+                """{"status":"error","message":"No XU units found. Run dumpxu first."}""",
             )
-            return false
+            return
         }
-
-        var chosenStreamAlt: UsbInterface? = null
-        var chosenEp: UsbEndpoint? = null
-        var bestScore = -1
-        for (intf in vsInterfaces) {
-            if (intf.id != vsInterfaceId || intf.endpointCount == 0) {
-                continue
-            }
-            for (e in 0 until intf.endpointCount) {
-                val ep = intf.getEndpoint(e)
-                if (ep.direction != UsbConstants.USB_DIR_IN) {
-                    continue
-                }
-                val score = ep.maxPacketSize + if (ep.type == UsbConstants.USB_ENDPOINT_XFER_ISOC) 100000 else 0
-                if (score > bestScore) {
-                    bestScore = score
-                    chosenStreamAlt = intf
-                    chosenEp = ep
-                }
-            }
-        }
-
-        if (chosenStreamAlt == null) {
-            isCameraActive = false
-            dispatchNativeEvent(
-                "state",
-                """{"status":"error","message":"No UVC VS stream alternate setting found."}""",
-            )
-            return false
-        }
-
-        val claimedControl = connection.claimInterface(controlAlt, true)
-        val setControlOk = connection.setInterface(controlAlt)
-        val claimedStream = connection.claimInterface(chosenStreamAlt, true)
-        val setStreamOk = connection.setInterface(chosenStreamAlt)
-        Log.i(
-            tag,
-            "activateCamera: vsIf=$vsInterfaceId controlAlt=${controlAlt.alternateSetting} claimedControl=$claimedControl setControl=$setControlOk streamAlt=${chosenStreamAlt.alternateSetting} claimedStream=$claimedStream setStream=$setStreamOk epType=${chosenEp?.type} epAddr=${chosenEp?.address} epMax=${chosenEp?.maxPacketSize}",
-        )
-
-        if (!claimedControl || !setControlOk || !claimedStream || !setStreamOk) {
-            isCameraActive = false
-            dispatchNativeEvent(
-                "state",
-                """{"status":"error","message":"Failed to set UVC stream alternate setting."}""",
-            )
-            return false
-        }
-
-        activeStreamEndpoint = chosenEp
-        val readerStarted = startStreamReader()
-        if (chosenEp != null && chosenEp.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-            val tmp = ByteArray(1024)
-            val rc = connection.bulkTransfer(chosenEp, tmp, tmp.size, 200)
-            Log.i(tag, "activateCamera: bulk probe rc=$rc")
-        }
-
         dispatchNativeEvent(
             "state",
-            """{"status":"connected","message":"UVC stream active (if=$vsInterfaceId, alt=${chosenStreamAlt.alternateSetting}, fmt=$formatIndex, frame=$frameIndex, reader=$readerStarted)."}""",
+            """{"status":"ready","message":"XU probe started (~15s). Watch for left/right yaw."}""",
         )
-        isCameraActive = true
-        return true
+        thread(name = "XuProbe", isDaemon = true) {
+            val reqTypeIn = 0xA1
+            val reqTypeOut = 0x21
+            val getLen = 0x85
+            val getInfo = 0x86
+            val setCur = 0x01
+            for (u in units) {
+                val selectors =
+                    (1..32).filter { sel ->
+                        val byteIdx = (sel - 1) / 8
+                        val bitIdx = (sel - 1) % 8
+                        byteIdx < u.bmControls.size && ((u.bmControls[byteIdx].toInt() ushr bitIdx) and 0x1) == 1
+                    }
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"ready","message":"XU unit=${u.unitId} selectors=${selectors.joinToString(",")}"}""",
+                )
+                for (sel in selectors.take(8)) {
+                    val wIndex = (u.unitId shl 8) or (vcInterface and 0xFF)
+                    val lenBuf = ByteArray(2)
+                    val infoBuf = ByteArray(1)
+                    val lenRc = connection.controlTransfer(reqTypeIn, getLen, sel shl 8, wIndex, lenBuf, lenBuf.size, 180)
+                    val infoRc = connection.controlTransfer(reqTypeIn, getInfo, sel shl 8, wIndex, infoBuf, infoBuf.size, 180)
+                    val ctrlLen =
+                        if (lenRc >= 2) {
+                            (lenBuf[0].toInt() and 0xFF) or ((lenBuf[1].toInt() and 0xFF) shl 8)
+                        } else {
+                            8
+                        }.coerceIn(1, 16)
+                    val info = if (infoRc >= 1) (infoBuf[0].toInt() and 0xFF) else -1
+                    Log.i(tag, "XU PROBE unit=${u.unitId} sel=$sel lenRc=$lenRc len=$ctrlLen infoRc=$infoRc info=$info")
+                    if (ctrlLen <= 0) {
+                        continue
+                    }
+                    val plus = ByteArray(ctrlLen)
+                    val minus = ByteArray(ctrlLen)
+                    if (ctrlLen >= 4) {
+                        ByteBuffer.wrap(plus).order(ByteOrder.LITTLE_ENDIAN).putInt(30000)
+                        ByteBuffer.wrap(minus).order(ByteOrder.LITTLE_ENDIAN).putInt(-30000)
+                    } else {
+                        plus[0] = 40
+                        minus[0] = (-40).toByte()
+                    }
+                    val rcPlus =
+                        connection.controlTransfer(reqTypeOut, setCur, sel shl 8, wIndex, plus, plus.size, 220)
+                    Thread.sleep(220)
+                    val rcMinus =
+                        connection.controlTransfer(reqTypeOut, setCur, sel shl 8, wIndex, minus, minus.size, 220)
+                    Thread.sleep(220)
+                    Log.i(
+                        tag,
+                        "XU PROBE SET unit=${u.unitId} sel=$sel len=$ctrlLen rcPlus=$rcPlus rcMinus=$rcMinus",
+                    )
+                }
+            }
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"XU probe finished. Tell me which step caused yaw."}""",
+            )
+        }
+    }
+
+    private fun runPtzProbeSweep() {
+        val connection = usbConnection
+        val device = usbDevice
+        if (connection == null || device == null) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"No USB connection. Connect first, then probeptz."}""",
+            )
+            return
+        }
+        val vcInterface = findVideoControlInterfaceNumber(device)
+        if (vcInterface < 0) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"No VC interface found for PTZ probe."}""",
+            )
+            return
+        }
+        val entities = findPtzEntityCandidates(connection).ifEmpty { listOf(1, 2, 3, 4, 5, 6, 9, 10, 11) }
+        dispatchNativeEvent(
+            "state",
+            """{"status":"ready","message":"PTZ probe started. Watch camera movement for ~12s."}""",
+        )
+        thread(name = "PtzProbe", isDaemon = true) {
+            val reqTypeOut = 0x21
+            val setCur = 0x01
+            val absSelector = 0x0D
+            val relSelector = 0x0E
+
+            fun send(
+                label: String,
+                selector: Int,
+                wIndex: Int,
+                payload: ByteArray,
+                timeout: Int = 250,
+            ): Int {
+                val rc =
+                    connection.controlTransfer(
+                        reqTypeOut,
+                        setCur,
+                        selector shl 8,
+                        wIndex,
+                        payload,
+                        payload.size,
+                        timeout,
+                    )
+                Log.i(
+                    tag,
+                    "PTZ PROBE $label selector=0x${selector.toString(16)} wIndex=$wIndex size=${payload.size} rc=$rc payload=${payload.joinToString(",") { (it.toInt() and 0xFF).toString() }}",
+                )
+                return rc
+            }
+
+            for (entityId in entities) {
+                val wIndexA = (entityId shl 8) or (vcInterface and 0xFF) // current mapping
+                val wIndexB = (vcInterface shl 8) or (entityId and 0xFF) // swapped mapping
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"ready","message":"PTZ probe entity=$entityId"}""",
+                )
+
+                // Absolute candidate, V4L2-like units (small/safe).
+                val absPlus =
+                    ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putInt(70000).putInt(0).array()
+                val absMinus =
+                    ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putInt(-70000).putInt(0).array()
+                send("absA+", absSelector, wIndexA, absPlus, 350)
+                Thread.sleep(260)
+                send("absA-", absSelector, wIndexA, absMinus, 350)
+                Thread.sleep(260)
+                send("absB+", absSelector, wIndexB, absPlus, 350)
+                Thread.sleep(260)
+                send("absB-", absSelector, wIndexB, absMinus, 350)
+                Thread.sleep(260)
+
+                // Relative candidates: standard-like and swapped-axis variants.
+                val relAPlus = byteArrayOf(1, 5, 0, 0)   // pan +, tilt 0
+                val relAMinus = byteArrayOf((-1).toByte(), 5, 0, 0) // pan -, tilt 0
+                val relBPlus = byteArrayOf(0, 0, 1, 5)   // tilt + (or maybe pan on this camera)
+                val relBMinus = byteArrayOf(0, 0, (-1).toByte(), 5)
+                send("relA+", relSelector, wIndexA, relAPlus, 350)
+                Thread.sleep(240)
+                send("relA-", relSelector, wIndexA, relAMinus, 350)
+                Thread.sleep(240)
+                send("relB+", relSelector, wIndexA, relBPlus, 350)
+                Thread.sleep(240)
+                send("relB-", relSelector, wIndexA, relBMinus, 350)
+                Thread.sleep(240)
+            }
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"PTZ probe finished. Share what motion you observed."}""",
+            )
+        }
+    }
+
+    private fun activateCameraStreamInterface(): Boolean {
+        val ok = nativeActivateCamera()
+        isCameraActive = ok
+        return ok
+    }
+
+    private fun activateCameraWithCamera2(): Boolean {
+        if (!ensureCameraPermission()) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"Camera permission required for Camera2 path."}""",
+            )
+            return false
+        }
+        val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val pickedId = pickPreferredCameraId(cameraManager)
+        if (pickedId == null) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"No Camera2 camera available."}""",
+            )
+            return false
+        }
+        val chars = cameraManager.getCameraCharacteristics(pickedId)
+        val cfg = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val size = cfg?.getOutputSizes(ImageFormat.YUV_420_888)?.maxByOrNull { it.width * it.height } ?: Size(640, 480)
+        stopCamera2Pipeline()
+        startCameraThread()
+        val handler = cameraHandler
+        if (handler == null) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"Failed to create camera handler thread."}""",
+            )
+            return false
+        }
+        imageReader =
+            ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 3).apply {
+                setOnImageAvailableListener(
+                    { reader ->
+                        val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                        try {
+                            cameraFramesSinceReport++
+                            val now = System.currentTimeMillis()
+                            if (cameraLastReportMs == 0L) {
+                                cameraLastReportMs = now
+                            }
+                            if (now - cameraLastReportMs >= 1000) {
+                                dispatchNativeEvent(
+                                    "stream",
+                                    """{"source":"camera2","frames":$cameraFramesSinceReport,"width":${img.width},"height":${img.height}}""",
+                                )
+                                Log.i(
+                                    tag,
+                                    "camera2Reader: frames=$cameraFramesSinceReport size=${img.width}x${img.height}",
+                                )
+                                cameraFramesSinceReport = 0
+                                cameraLastReportMs = now
+                            }
+                        } finally {
+                            img.close()
+                        }
+                    },
+                    handler,
+                )
+            }
+
+        try {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                return false
+            }
+            cameraManager.openCamera(
+                pickedId,
+                object : CameraDevice.StateCallback() {
+                    override fun onOpened(device: CameraDevice) {
+                        cameraDevice = device
+                        val output = imageReader?.surface
+                        if (output == null) {
+                            dispatchNativeEvent(
+                                "state",
+                                """{"status":"error","message":"Camera2 ImageReader surface missing."}""",
+                            )
+                            return
+                        }
+                        createCamera2Session(device, output, handler)
+                    }
+
+                    override fun onDisconnected(device: CameraDevice) {
+                        device.close()
+                        if (cameraDevice === device) {
+                            cameraDevice = null
+                        }
+                        dispatchNativeEvent(
+                            "state",
+                            """{"status":"error","message":"Camera2 external camera disconnected."}""",
+                        )
+                    }
+
+                    override fun onError(device: CameraDevice, error: Int) {
+                        device.close()
+                        if (cameraDevice === device) {
+                            cameraDevice = null
+                        }
+                        dispatchNativeEvent(
+                            "state",
+                            """{"status":"error","message":"Camera2 open error code=$error"}""",
+                        )
+                    }
+                },
+                handler,
+            )
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"Opening Camera2 camera id=$pickedId..."}""",
+            )
+            return true
+        } catch (t: Throwable) {
+            Log.e(tag, "activateCameraWithCamera2 failed", t)
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"Camera2 activation exception: ${t.message ?: "unknown"}"}""",
+            )
+            return false
+        }
+    }
+
+    private fun createCamera2Session(device: CameraDevice, outputSurface: Surface, handler: Handler) {
+        try {
+            val request =
+                device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                    addTarget(outputSurface)
+                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                }
+            device.createCaptureSession(
+                listOf(outputSurface),
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        captureSession = session
+                        try {
+                            session.setRepeatingRequest(request.build(), null, handler)
+                            isCameraActive = true
+                            dispatchNativeEvent(
+                                "state",
+                                """{"status":"connected","message":"Camera2 stream active (external camera)."}""",
+                            )
+                        } catch (t: Throwable) {
+                            Log.e(tag, "Camera2 setRepeatingRequest failed", t)
+                            dispatchNativeEvent(
+                                "state",
+                                """{"status":"error","message":"Camera2 setRepeatingRequest failed: ${t.message ?: "unknown"}"}""",
+                            )
+                        }
+                    }
+
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        dispatchNativeEvent(
+                            "state",
+                            """{"status":"error","message":"Camera2 capture session configure failed."}""",
+                        )
+                    }
+                },
+                handler,
+            )
+        } catch (t: Throwable) {
+            Log.e(tag, "createCamera2Session failed", t)
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"Camera2 session exception: ${t.message ?: "unknown"}"}""",
+            )
+        }
+    }
+
+    private fun startCameraThread() {
+        if (cameraThread != null) {
+            return
+        }
+        cameraThread = HandlerThread("ExternalCam2").apply { start() }
+        cameraHandler = Handler(cameraThread!!.looper)
+    }
+
+    private fun stopCameraThread() {
+        val t = cameraThread ?: return
+        t.quitSafely()
+        runCatching { t.join(500) }
+        cameraThread = null
+        cameraHandler = null
+    }
+
+    private fun stopCamera2Pipeline() {
+        runCatching { captureSession?.close() }
+        runCatching { cameraDevice?.close() }
+        runCatching { imageReader?.close() }
+        captureSession = null
+        cameraDevice = null
+        imageReader = null
+        cameraFramesSinceReport = 0
+        cameraLastReportMs = 0
+        stopCameraThread()
+    }
+
+    private fun pickPreferredCameraId(cameraManager: CameraManager): String? {
+        var fallback: String? = null
+        for (id in cameraManager.cameraIdList) {
+            val chars = cameraManager.getCameraCharacteristics(id)
+            val facing = chars.get(CameraCharacteristics.LENS_FACING)
+            val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+            Log.i(
+                tag,
+                "camera2 candidate id=$id facing=$facing caps=${caps.joinToString(",")}",
+            )
+            if (fallback == null) {
+                fallback = id
+            }
+            if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL) {
+                return id
+            }
+        }
+        return fallback
     }
 
     private fun chooseStreamParams(connection: UsbDeviceConnection): Triple<Int, Int, Int> {
@@ -699,53 +1207,63 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                 var requestMode = false
                 var usbRequest: UsbRequest? = null
                 while (streamReaderRunning.get()) {
-                    if (!requestMode) {
-                        val rc = connection.bulkTransfer(endpoint, buf, buf.size, 1000)
-                        if (rc > 0) {
-                            timeoutStreak = 0
-                            packets++
-                            bytes += rc.toLong()
-                            val headerLen = buf[0].toInt() and 0xFF
-                            if (headerLen in 2..rc) {
-                                val payload = rc - headerLen
-                                if (payload > 0) {
-                                    payloadBytes += payload.toLong()
+                    try {
+                        if (!requestMode) {
+                            val rc = connection.bulkTransfer(endpoint, buf, buf.size, 1000)
+                            if (rc > 0) {
+                                timeoutStreak = 0
+                                packets++
+                                bytes += rc.toLong()
+                                val headerLen = buf[0].toInt() and 0xFF
+                                if (headerLen in 2..rc) {
+                                    val payload = rc - headerLen
+                                    if (payload > 0) {
+                                        payloadBytes += payload.toLong()
+                                    }
+                                    val info = buf[1].toInt() and 0xFF
+                                    if ((info and 0x02) != 0) {
+                                        frames++
+                                    }
                                 }
-                                val info = buf[1].toInt() and 0xFF
-                                if ((info and 0x02) != 0) {
-                                    frames++
-                                }
-                            }
-                        } else {
-                            timeoutStreak++
-                            if (timeoutStreak >= 5) {
-                                usbRequest = UsbRequest().also { it.initialize(connection, endpoint) }
-                                requestMode = usbRequest != null
-                                Log.i(tag, "streamReader: switching to UsbRequest mode requestMode=$requestMode")
-                            }
-                        }
-                    } else {
-                        val req = usbRequest
-                        if (req == null) {
-                            requestMode = false
-                        } else {
-                            val bb = ByteBuffer.allocateDirect(buf.size)
-                            val queued = req.queue(bb, buf.size)
-                            if (!queued) {
-                                Log.w(tag, "streamReader: UsbRequest queue failed")
-                                requestMode = false
-                                req.close()
-                                usbRequest = null
                             } else {
-                                val completed = connection.requestWait(1000)
-                                if (completed == req) {
-                                    val n = bb.position()
-                                    if (n > 0) {
-                                        packets++
-                                        bytes += n.toLong()
+                                timeoutStreak++
+                                if (timeoutStreak >= 5) {
+                                    usbRequest = UsbRequest().also { it.initialize(connection, endpoint) }
+                                    requestMode = usbRequest != null
+                                    Log.i(tag, "streamReader: switching to UsbRequest mode requestMode=$requestMode")
+                                }
+                            }
+                        } else {
+                            val req = usbRequest
+                            if (req == null) {
+                                requestMode = false
+                            } else {
+                                val bb = ByteBuffer.allocateDirect(buf.size)
+                                val queued = req.queue(bb, buf.size)
+                                if (!queued) {
+                                    Log.w(tag, "streamReader: UsbRequest queue failed")
+                                    requestMode = false
+                                    req.close()
+                                    usbRequest = null
+                                } else {
+                                    val completed = connection.requestWait(1000)
+                                    if (completed == req) {
+                                        val n = bb.position()
+                                        if (n > 0) {
+                                            packets++
+                                            bytes += n.toLong()
+                                        }
                                     }
                                 }
                             }
+                        }
+                    } catch (t: Throwable) {
+                        Log.w(tag, "streamReader: usb read exception ${t.message}")
+                        requestMode = false
+                        runCatching { usbRequest?.close() }
+                        usbRequest = null
+                        if (!streamReaderRunning.get()) {
+                            break
                         }
                     }
                     val now = System.currentTimeMillis()
@@ -804,7 +1322,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         claimedInterfaces.clear()
     }
 
-    private fun sendManualGimbalCommand(pan: Float, tilt: Float, durationMs: Int): Boolean {
+    private fun sendManualGimbalCommand(
+        pan: Float,
+        tilt: Float,
+        durationMs: Int,
+        force: Boolean = false,
+    ): Boolean {
         val connection = usbConnection
         val device = usbDevice
         if (connection == null || device == null) {
@@ -815,162 +1338,63 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             )
             return false
         }
+        if (!force && kotlin.math.abs(pan) < panDeadzone && kotlin.math.abs(tilt) < tiltDeadzone) {
+            Log.i(
+                tag,
+                "sendManualGimbalCommand: ignored by deadzone pan=$pan tilt=$tilt dz=($panDeadzone,$tiltDeadzone)",
+            )
+            return true
+        }
         val vcInterface = findVideoControlInterfaceNumber(device)
         if (vcInterface < 0) {
             Log.w(tag, "sendManualGimbalCommand: no VC interface")
             return false
         }
 
-        val parsedEntities = findPtzEntityCandidates(connection)
-        val entities = if (parsedEntities.isEmpty()) listOf(1, 2, 3, 4, 5, 6) else parsedEntities
-        val selector = 0x0D // CT_PANTILT_ABSOLUTE_CONTROL
-        val reqTypeOut = 0x21
-        val reqTypeIn = 0xA1
-        val setCur = 0x01
-        val getInfo = 0x86
-        val getMin = 0x82
-        val getMax = 0x83
-        val panScales = intArrayOf(36000, 648000, 3600)
-        var succeeded = false
+        val panMin = -522000
+        val panMax = 522000
+        val tiltMin = -324000
+        val tiltMax = 360000
 
-        for (entityId in entities) {
-            val infoBuf = ByteArray(1)
-            val infoRc =
-                connection.controlTransfer(
-                    reqTypeIn,
-                    getInfo,
-                    selector shl 8,
-                    (entityId shl 8) or (vcInterface and 0xFF),
-                    infoBuf,
-                    infoBuf.size,
-                    200,
-                )
-            Log.i(
-                tag,
-                "PTZ GET_INFO abs entity=$entityId vcIf=$vcInterface rc=$infoRc info=${if (infoRc > 0) infoBuf[0].toInt() and 0xFF else -1}",
+        // Use the exact Linux-captured tuple:
+        // bmRequestType=0x21, bRequest=0x01, wValue=0x0d00, wIndex=0x0100, 8-byte payload [pan_i32_le, tilt_i32_le]
+        val panStep = (pan.coerceIn(-1f, 1f) * 90000f).roundToInt()
+        val tiltStep = (tilt.coerceIn(-1f, 1f) * 68400f).roundToInt()
+        currentPanAbs = (currentPanAbs + panStep).coerceIn(panMin, panMax)
+        currentTiltAbs = (currentTiltAbs + tiltStep).coerceIn(tiltMin, tiltMax)
+        val linuxPayload =
+            ByteBuffer
+                .allocate(8)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(currentPanAbs)
+                .putInt(currentTiltAbs)
+                .array()
+        val linuxRc =
+            connection.controlTransfer(
+                0x21,
+                0x01,
+                0x0D00,
+                0x0100,
+                linuxPayload,
+                linuxPayload.size,
+                durationMs.coerceIn(80, 2000),
             )
-            val minAbs = readAbsolutePtzPair(connection, selector, entityId, vcInterface, getMin)
-            val maxAbs = readAbsolutePtzPair(connection, selector, entityId, vcInterface, getMax)
-            Log.i(
-                tag,
-                "PTZ RANGE abs entity=$entityId min=$minAbs max=$maxAbs",
-            )
-
-            if (
-                minAbs != null &&
-                    maxAbs != null &&
-                    (minAbs.first != maxAbs.first || minAbs.second != maxAbs.second)
-            ) {
-                val panRaw = lerpSignedRange(pan, minAbs.first, maxAbs.first)
-                val tiltRaw = lerpSignedRange(tilt, minAbs.second, maxAbs.second)
-                val payload =
-                    ByteBuffer
-                        .allocate(8)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .putInt(panRaw)
-                        .putInt(tiltRaw)
-                        .array()
-                val mappedRc =
-                    connection.controlTransfer(
-                        reqTypeOut,
-                        setCur,
-                        selector shl 8,
-                        (entityId shl 8) or (vcInterface and 0xFF),
-                        payload,
-                        payload.size,
-                        durationMs.coerceIn(50, 2000),
-                    )
-                Log.i(
-                    tag,
-                    "PTZ SET_CUR abs(mapped) entity=$entityId panRaw=$panRaw tiltRaw=$tiltRaw rc=$mappedRc",
-                )
-                if (mappedRc >= 0) {
-                    succeeded = true
-                }
-            }
-
-            if (succeeded) {
-                break
-            }
-            for (scale in panScales) {
-                val panRaw = (pan.coerceIn(-1f, 1f) * scale).roundToInt()
-                val tiltRaw = (tilt.coerceIn(-1f, 1f) * scale).roundToInt()
-                val payload =
-                    ByteBuffer
-                        .allocate(8)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .putInt(panRaw)
-                        .putInt(tiltRaw)
-                        .array()
-                val wValue = selector shl 8
-                val wIndex = (entityId shl 8) or (vcInterface and 0xFF)
-                val rc =
-                    connection.controlTransfer(
-                        reqTypeOut,
-                        setCur,
-                        wValue,
-                        wIndex,
-                        payload,
-                        payload.size,
-                        durationMs.coerceIn(50, 2000),
-                    )
-                Log.i(
-                    tag,
-                    "PTZ SET_CUR abs entity=$entityId vcIf=$vcInterface scale=$scale panRaw=$panRaw tiltRaw=$tiltRaw rc=$rc",
-                )
-                if (rc >= 0) {
-                    succeeded = true
-                    break
-                }
-            }
-            if (!succeeded) {
-                val relSelector = 0x0E // CT_PANTILT_RELATIVE_CONTROL
-                val panDir = if (pan > 0.05f) 1 else if (pan < -0.05f) -1 else 0
-                val tiltDir = if (tilt > 0.05f) 1 else if (tilt < -0.05f) -1 else 0
-                val panSpeed = (pan.coerceIn(-1f, 1f).let { kotlin.math.abs(it) } * 7f).roundToInt().coerceIn(0, 7)
-                val tiltSpeed = (tilt.coerceIn(-1f, 1f).let { kotlin.math.abs(it) } * 7f).roundToInt().coerceIn(0, 7)
-                val relPayload =
-                    byteArrayOf(
-                        panDir.toByte(),
-                        panSpeed.toByte(),
-                        tiltDir.toByte(),
-                        tiltSpeed.toByte(),
-                    )
-                val relRc =
-                    connection.controlTransfer(
-                        reqTypeOut,
-                        setCur,
-                        relSelector shl 8,
-                        (entityId shl 8) or (vcInterface and 0xFF),
-                        relPayload,
-                        relPayload.size,
-                        durationMs.coerceIn(50, 2000),
-                    )
-                Log.i(
-                    tag,
-                    "PTZ SET_CUR rel entity=$entityId vcIf=$vcInterface panDir=$panDir panSpeed=$panSpeed tiltDir=$tiltDir tiltSpeed=$tiltSpeed rc=$relRc",
-                )
-                if (relRc >= 0) {
-                    succeeded = true
-                }
-            }
-            if (succeeded) {
-                break
-            }
-        }
-
-        if (succeeded) {
+        Log.i(
+            tag,
+            "PTZ SET_CUR linux-captured wIndex=0x0100 panAbs=$currentPanAbs tiltAbs=$currentTiltAbs rc=$linuxRc",
+        )
+        if (linuxRc >= 0) {
             dispatchNativeEvent(
                 "state",
-                """{"status":"connected","message":"PTZ command sent (experimental UVC path)."}""",
+                """{"status":"connected","message":"PTZ command sent (linux tuple)."}""",
             )
-        } else {
-            dispatchNativeEvent(
-                "state",
-                """{"status":"error","message":"PTZ transfer failed on tested entities."}""",
-            )
+            return true
         }
-        return succeeded
+        dispatchNativeEvent(
+            "state",
+            """{"status":"error","message":"PTZ transfer failed on linux tuple path."}""",
+        )
+        return false
     }
 
     private fun readAbsolutePtzPair(
@@ -1014,6 +1438,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             }
         }
         return -1
+    }
+
+    private fun isCenterCommand(pan: Float, tilt: Float): Boolean {
+        return kotlin.math.abs(pan) < 0.02f && kotlin.math.abs(tilt) < 0.02f
     }
 
     private fun findPtzEntityCandidates(connection: UsbDeviceConnection): List<Int> {

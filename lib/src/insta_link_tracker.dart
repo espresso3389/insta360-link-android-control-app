@@ -91,6 +91,34 @@ class InstaLinkTracker {
     return result ?? false;
   }
 
+  Future<bool> reconnect() async {
+    final bool? result = await _methodChannel.invokeMethod<bool>("reconnect");
+    return result ?? false;
+  }
+
+  Future<bool> activateCamera() async {
+    final bool? result = await _methodChannel.invokeMethod<bool>(
+      "activateCamera",
+    );
+    return result ?? false;
+  }
+
+  Future<bool> manualControl({
+    required double pan,
+    required double tilt,
+    int durationMs = 350,
+  }) async {
+    final bool? result = await _methodChannel.invokeMethod<bool>(
+      "manualControl",
+      <String, dynamic>{
+        "pan": pan,
+        "tilt": tilt,
+        "durationMs": durationMs,
+      },
+    );
+    return result ?? false;
+  }
+
   Future<bool> dispose() async {
     final bool? result = await _methodChannel.invokeMethod<bool>("dispose");
     return result ?? false;

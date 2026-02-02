@@ -19,12 +19,20 @@ class _TrackingPageState extends State<TrackingPage> {
   String _status = "idle";
   String _message = "Press Initialize to start.";
   bool _isRunning = false;
+  bool _linkTrackingToGimbal = true;
+  int _lastGimbalCmdMs = 0;
 
   double _fps = 0;
   double _latencyMs = 0;
   double _pan = 0;
   double _tilt = 0;
   Map<String, dynamic>? _face;
+  double _streamKbps = 0;
+  int _streamPackets = 0;
+  int _streamFrames = 0;
+  int _streamBytes = 0;
+  String _streamSource = "uvc";
+  String _connectedDeviceName = "-";
 
   double _kpX = 0.015;
   double _kiX = 0;
@@ -63,8 +71,42 @@ class _TrackingPageState extends State<TrackingPage> {
         _tilt = _asDouble(event["tilt"], _tilt);
       } else if (type == "face") {
         _face = event;
+      } else if (type == "stream") {
+        _streamKbps = _asDouble(event["kbps"], _streamKbps);
+        _streamPackets = (event["packets"] as num?)?.toInt() ?? _streamPackets;
+        _streamFrames = (event["frames"] as num?)?.toInt() ?? _streamFrames;
+        _streamBytes = (event["bytes"] as num?)?.toInt() ?? _streamBytes;
+        _streamSource = (event["source"] ?? _streamSource).toString();
       }
     });
+    if (type == "telemetry") {
+      unawaited(_maybeSendTrackingGimbal(_pan, _tilt, _fps));
+    }
+  }
+
+  Future<void> _maybeSendTrackingGimbal(
+    double pan,
+    double tilt,
+    double fps,
+  ) async {
+    if (!_isRunning || !_linkTrackingToGimbal || fps <= 0) {
+      return;
+    }
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastGimbalCmdMs < 180) {
+      return;
+    }
+    final double panCmd = (pan * 60).clamp(-1.0, 1.0);
+    final double tiltCmd = (tilt * 60).clamp(-1.0, 1.0);
+    if (panCmd.abs() < 0.05 && tiltCmd.abs() < 0.05) {
+      return;
+    }
+    _lastGimbalCmdMs = now;
+    await _tracker.manualControl(
+      pan: panCmd,
+      tilt: tiltCmd,
+      durationMs: 200,
+    );
   }
 
   double _asDouble(dynamic value, double fallback) {
@@ -72,6 +114,13 @@ class _TrackingPageState extends State<TrackingPage> {
       return value.toDouble();
     }
     return fallback;
+  }
+
+  Future<void> _refreshDevices() async {
+    final List<Map<String, dynamic>> devices = await _tracker.listDevices();
+    setState(() {
+      _devices = devices;
+    });
   }
 
   Future<void> _initialize() async {
@@ -83,13 +132,15 @@ class _TrackingPageState extends State<TrackingPage> {
       });
       return;
     }
-    final List<Map<String, dynamic>> devices = await _tracker.listDevices();
+    await _refreshDevices();
+    final int uvcCount = _devices
+        .where((Map<String, dynamic> d) => d["isUvc"] == true)
+        .length;
     setState(() {
-      _devices = devices;
       _status = "ready";
-      _message = devices.isEmpty
+      _message = uvcCount == 0
           ? "No UVC devices found."
-          : "Found ${devices.length} UVC device(s).";
+          : "Found $uvcCount UVC device(s).";
     });
   }
 
@@ -97,12 +148,25 @@ class _TrackingPageState extends State<TrackingPage> {
     if (_devices.isEmpty) {
       return;
     }
-    final Map<String, dynamic> first = _devices.first;
+    final Map<String, dynamic>? first = _devices
+        .cast<Map<String, dynamic>?>()
+        .firstWhere(
+          (Map<String, dynamic>? d) => (d?["isUvc"] == true),
+          orElse: () => null,
+        );
+    if (first == null) {
+      setState(() {
+        _status = "error";
+        _message = "No UVC camera device found. Hub/device order changed.";
+      });
+      return;
+    }
     final bool ok = await _tracker.connectDevice(
       vid: (first["vid"] as num?)?.toInt() ?? 0,
       pid: (first["pid"] as num?)?.toInt() ?? 0,
     );
     setState(() {
+      _connectedDeviceName = (first["name"] ?? "-").toString();
       _status = ok ? "connected" : "error";
       _message = ok
           ? "Connected to ${first["name"] ?? "device"}."
@@ -127,12 +191,47 @@ class _TrackingPageState extends State<TrackingPage> {
     });
   }
 
+  Future<void> _reconnectNow() async {
+    final bool ok = await _tracker.reconnect();
+    setState(() {
+      _status = ok ? "connected" : "error";
+      _message = ok ? "Reconnect succeeded." : "Reconnect failed.";
+    });
+    if (ok) {
+      await _refreshDevices();
+    }
+  }
+
   Future<void> _stopTracking() async {
     final bool ok = await _tracker.stopTracking();
     setState(() {
       _status = ok ? "connected" : "error";
       _isRunning = false;
       _message = ok ? "Tracking stopped." : "Stop failed.";
+    });
+  }
+
+  Future<void> _activateCamera() async {
+    final bool ok = await _tracker.activateCamera();
+    setState(() {
+      _status = ok ? "connected" : "error";
+      _message = ok ? "Camera activated." : "Camera activation failed.";
+    });
+  }
+
+  Future<void> _manualMove(double pan, double tilt) async {
+    final bool ok = await _tracker.manualControl(
+      pan: pan,
+      tilt: tilt,
+      durationMs: 550,
+    );
+    setState(() {
+      _message = ok
+          ? "Manual move pan=${pan.toStringAsFixed(2)}, tilt=${tilt.toStringAsFixed(2)}"
+          : "Manual move failed.";
+      if (!ok) {
+        _status = "error";
+      }
     });
   }
 
@@ -159,11 +258,24 @@ class _TrackingPageState extends State<TrackingPage> {
                       children: <Widget>[
                         _ControlsCard(
                           onInitialize: _initialize,
+                          onRefresh: _refreshDevices,
+                          onReconnect: _reconnectNow,
                           onConnect: _connectFirstDevice,
+                          onActivateCamera: _activateCamera,
                           onStart: _startTracking,
                           onStop: _stopTracking,
                           hasDevices: _devices.isNotEmpty,
                           running: _isRunning,
+                        ),
+                        const SizedBox(height: 12),
+                        _GimbalCard(
+                          onMove: _manualMove,
+                          linkTrackingToGimbal: _linkTrackingToGimbal,
+                          onToggleLink: (bool v) {
+                            setState(() {
+                              _linkTrackingToGimbal = v;
+                            });
+                          },
                         ),
                         const SizedBox(height: 12),
                         _TelemetryCard(
@@ -171,6 +283,21 @@ class _TrackingPageState extends State<TrackingPage> {
                           latencyMs: _latencyMs,
                           pan: _pan,
                           tilt: _tilt,
+                        ),
+                        const SizedBox(height: 12),
+                        _UsbHealthCard(
+                          connectedDeviceName: _connectedDeviceName,
+                          totalDevices: _devices.length,
+                          uvcDevices: _devices
+                              .where(
+                                (Map<String, dynamic> d) => d["isUvc"] == true,
+                              )
+                              .length,
+                          streamSource: _streamSource,
+                          streamKbps: _streamKbps,
+                          streamPackets: _streamPackets,
+                          streamFrames: _streamFrames,
+                          streamBytes: _streamBytes,
                         ),
                         const SizedBox(height: 12),
                         _PidCard(
@@ -302,7 +429,10 @@ class _FacePainter extends CustomPainter {
 class _ControlsCard extends StatelessWidget {
   const _ControlsCard({
     required this.onInitialize,
+    required this.onRefresh,
+    required this.onReconnect,
     required this.onConnect,
+    required this.onActivateCamera,
     required this.onStart,
     required this.onStop,
     required this.hasDevices,
@@ -310,7 +440,10 @@ class _ControlsCard extends StatelessWidget {
   });
 
   final Future<void> Function() onInitialize;
+  final Future<void> Function() onRefresh;
+  final Future<void> Function() onReconnect;
   final Future<void> Function() onConnect;
+  final Future<void> Function() onActivateCamera;
   final Future<void> Function() onStart;
   final Future<void> Function() onStop;
   final bool hasDevices;
@@ -335,9 +468,26 @@ class _ControlsCard extends StatelessWidget {
               label: const Text("Initialize"),
             ),
             const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: onRefresh,
+              icon: const Icon(Icons.refresh),
+              label: const Text("Refresh USB"),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: onReconnect,
+              icon: const Icon(Icons.usb_off),
+              label: const Text("Reconnect Now"),
+            ),
+            const SizedBox(height: 8),
             OutlinedButton(
               onPressed: hasDevices ? onConnect : null,
               child: const Text("Connect First Device"),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              onPressed: onActivateCamera,
+              child: const Text("Activate Camera"),
             ),
             const SizedBox(height: 8),
             FilledButton(
@@ -348,6 +498,90 @@ class _ControlsCard extends StatelessWidget {
             OutlinedButton(
               onPressed: running ? onStop : null,
               child: const Text("Stop Tracking"),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GimbalCard extends StatelessWidget {
+  const _GimbalCard({
+    required this.onMove,
+    required this.linkTrackingToGimbal,
+    required this.onToggleLink,
+  });
+
+  final Future<void> Function(double pan, double tilt) onMove;
+  final bool linkTrackingToGimbal;
+  final ValueChanged<bool> onToggleLink;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            const Text(
+              "Gimbal Presets",
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text("Link Tracking -> Gimbal"),
+              value: linkTrackingToGimbal,
+              onChanged: onToggleLink,
+            ),
+            const SizedBox(height: 4),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => onMove(0, 1),
+                    child: const Text("Up"),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => onMove(-1, 0),
+                    child: const Text("Left"),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => onMove(0, 0),
+                    child: const Text("Center"),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => onMove(1, 0),
+                    child: const Text("Right"),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => onMove(0, -1),
+                    child: const Text("Down"),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -386,6 +620,53 @@ class _TelemetryCard extends StatelessWidget {
             Text("Latency: ${latencyMs.toStringAsFixed(1)} ms"),
             Text("Pan: ${pan.toStringAsFixed(2)}"),
             Text("Tilt: ${tilt.toStringAsFixed(2)}"),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _UsbHealthCard extends StatelessWidget {
+  const _UsbHealthCard({
+    required this.connectedDeviceName,
+    required this.totalDevices,
+    required this.uvcDevices,
+    required this.streamSource,
+    required this.streamKbps,
+    required this.streamPackets,
+    required this.streamFrames,
+    required this.streamBytes,
+  });
+
+  final String connectedDeviceName;
+  final int totalDevices;
+  final int uvcDevices;
+  final String streamSource;
+  final double streamKbps;
+  final int streamPackets;
+  final int streamFrames;
+  final int streamBytes;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            const Text(
+              "USB Health",
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 6),
+            Text("Connected: $connectedDeviceName"),
+            Text("USB devices: $totalDevices (UVC: $uvcDevices)"),
+            Text("Stream source: $streamSource"),
+            Text("Stream: ${streamKbps.toStringAsFixed(1)} kb/s"),
+            Text("Packets: $streamPackets  Frames: $streamFrames"),
+            Text("Bytes/s: $streamBytes"),
           ],
         ),
       ),

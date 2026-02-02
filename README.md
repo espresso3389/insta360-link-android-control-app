@@ -32,8 +32,14 @@ adb shell am start -n com.example.insta360link_android_test/.MainActivity --es c
 # Activate UVC stream (PROBE/COMMIT + stream alt selection)
 adb shell am start -n com.example.insta360link_android_test/.MainActivity --es cmd activate
 
+# Activate Android Camera2 external-camera stream fallback
+adb shell am start -n com.example.insta360link_android_test/.MainActivity --es cmd activate2
+
 # Manual pan/tilt command hook (currently telemetry/state hook)
 adb shell am start -n com.example.insta360link_android_test/.MainActivity --es cmd manual --ef pan 0.2 --ef tilt -0.1 --ei durationMs 400
+
+# Replay Linux-captured PTZ baseline packets
+adb shell am start -n com.example.insta360link_android_test/.MainActivity --es cmd replaylinux
 ```
 
 ### Helper script
@@ -44,7 +50,9 @@ Use `scripts/adb_camctl.ps1` to run command + fetch logs:
 .\scripts\adb_camctl.ps1 -Cmd list
 .\scripts\adb_camctl.ps1 -Cmd connect -VendorId 11802 -ProductId 19457
 .\scripts\adb_camctl.ps1 -Cmd activate
+.\scripts\adb_camctl.ps1 -Cmd activate2
 .\scripts\adb_camctl.ps1 -Cmd start
 .\scripts\adb_camctl.ps1 -Cmd manual -Pan 0.2 -Tilt -0.1 -DurationMs 400
+.\scripts\adb_camctl.ps1 -Cmd replaylinux
 .\scripts\adb_camctl.ps1 -Cmd stop
 ```

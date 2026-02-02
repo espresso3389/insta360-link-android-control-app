@@ -1,7 +1,7 @@
 param(
     [string]$Device = "",
     [Parameter(Mandatory = $true)]
-    [ValidateSet("init", "list", "connect", "start", "stop", "detach", "policy", "manual", "activate")]
+    [ValidateSet("init", "list", "connect", "start", "stop", "detach", "policy", "manual", "activate", "activate2", "probeptz", "dumpxu", "probexu", "replaylinux")]
     [string]$Cmd,
     [int]$VendorId = 0,
     [int]$ProductId = 0,

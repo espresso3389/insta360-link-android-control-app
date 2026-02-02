@@ -1,12 +1,17 @@
 #include <jni.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+
+#include <libusb.h>
+#include <libuvc/libuvc.h>
 
 namespace {
 
@@ -20,6 +25,14 @@ std::mutex g_state_mutex;
 int g_usb_fd = -1;
 int g_usb_vid = 0;
 int g_usb_pid = 0;
+libusb_context * g_usb_ctx = nullptr;
+uvc_context_t * g_uvc_ctx = nullptr;
+uvc_device_handle_t * g_uvc_devh = nullptr;
+std::atomic<bool> g_uvc_streaming{false};
+std::atomic<uint64_t> g_stream_frame_count{0};
+std::atomic<uint64_t> g_stream_byte_count{0};
+std::atomic<bool> g_usb_events_running{false};
+std::thread g_usb_events_thread;
 
 float g_kp_x = 0.015f;
 float g_ki_x = 0.0f;
@@ -59,8 +72,174 @@ void emit_state(const std::string & status, const std::string & message) {
     send_event("state", out.str());
 }
 
+void on_uvc_frame(uvc_frame_t * frame, void *) {
+    if (!g_uvc_streaming.load() || frame == nullptr) {
+        return;
+    }
+    g_stream_frame_count.fetch_add(1, std::memory_order_relaxed);
+    g_stream_byte_count.fetch_add(static_cast<uint64_t>(frame->data_bytes), std::memory_order_relaxed);
+}
+
+void stop_usb_events_locked() {
+    if (!g_usb_events_running.exchange(false)) {
+        return;
+    }
+    if (g_usb_events_thread.joinable()) {
+        g_usb_events_thread.join();
+    }
+}
+
+void start_usb_events_locked() {
+    if (g_usb_ctx == nullptr || g_usb_events_running.load()) {
+        return;
+    }
+    g_usb_events_running.store(true);
+    g_usb_events_thread = std::thread([]() {
+        while (g_usb_events_running.load()) {
+            if (g_usb_ctx == nullptr) {
+                break;
+            }
+            timeval timeout{};
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 100000;
+            const int rc = libusb_handle_events_timeout_completed(g_usb_ctx, &timeout, nullptr);
+            if (rc == LIBUSB_ERROR_INTERRUPTED) {
+                continue;
+            }
+            if (rc < 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+    });
+}
+
+void shutdown_uvc_locked() {
+    if (g_uvc_streaming.exchange(false) && g_uvc_devh != nullptr) {
+        uvc_stop_streaming(g_uvc_devh);
+    }
+    stop_usb_events_locked();
+    if (g_uvc_devh != nullptr) {
+        uvc_close(g_uvc_devh);
+        g_uvc_devh = nullptr;
+    }
+    if (g_uvc_ctx != nullptr) {
+        uvc_exit(g_uvc_ctx);
+        g_uvc_ctx = nullptr;
+    }
+    if (g_usb_ctx != nullptr) {
+        libusb_exit(g_usb_ctx);
+        g_usb_ctx = nullptr;
+    }
+    g_stream_frame_count.store(0, std::memory_order_relaxed);
+    g_stream_byte_count.store(0, std::memory_order_relaxed);
+}
+
+bool init_uvc_from_fd_locked(int fd) {
+    shutdown_uvc_locked();
+    if (fd < 0) {
+        return false;
+    }
+
+    libusb_init_option options[1]{};
+    options[0].option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY;
+    options[0].value.ival = 1;
+    int rc = libusb_init_context(&g_usb_ctx, options, 1);
+    if (rc != LIBUSB_SUCCESS || g_usb_ctx == nullptr) {
+        std::ostringstream out;
+        out << "libusb_init_context failed: " << rc << " (" << libusb_error_name(rc) << ")";
+        emit_state("error", out.str());
+        shutdown_uvc_locked();
+        return false;
+    }
+    const uvc_error_t init_rc = uvc_init(&g_uvc_ctx, g_usb_ctx);
+    if (init_rc != UVC_SUCCESS || g_uvc_ctx == nullptr) {
+        std::ostringstream out;
+        out << "uvc_init failed: " << init_rc;
+        emit_state("error", out.str());
+        shutdown_uvc_locked();
+        return false;
+    }
+
+    const uvc_error_t wrap_rc = uvc_wrap(fd, g_uvc_ctx, &g_uvc_devh);
+    if (wrap_rc != UVC_SUCCESS || g_uvc_devh == nullptr) {
+        std::ostringstream out;
+        out << "uvc_wrap(fd) failed: " << wrap_rc;
+        emit_state("error", out.str());
+        shutdown_uvc_locked();
+        return false;
+    }
+
+    emit_state("connected", "Native UVC handle ready.");
+    return true;
+}
+
+bool start_uvc_stream_locked() {
+    if (g_uvc_streaming.load()) {
+        return true;
+    }
+    if (g_uvc_devh == nullptr) {
+        emit_state("error", "UVC device is not ready.");
+        return false;
+    }
+
+    struct Attempt {
+        uvc_frame_format format;
+        int width;
+        int height;
+        int fps;
+        const char * label;
+    };
+    const Attempt attempts[] = {
+        {UVC_FRAME_FORMAT_MJPEG, 1920, 1080, 30, "mjpeg_1080p30"},
+        {UVC_FRAME_FORMAT_MJPEG, 1280, 720, 30, "mjpeg_720p30"},
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, "mjpeg_480p30"},
+        {UVC_FRAME_FORMAT_YUYV, 640, 480, 30, "yuyv_480p30"},
+        {UVC_FRAME_FORMAT_ANY, 640, 480, 30, "any_480p30"},
+    };
+
+    uvc_stream_ctrl_t ctrl{};
+    const Attempt * chosen = nullptr;
+    for (const auto & attempt : attempts) {
+        const uvc_error_t ctrl_rc = uvc_get_stream_ctrl_format_size(
+            g_uvc_devh,
+            &ctrl,
+            attempt.format,
+            attempt.width,
+            attempt.height,
+            attempt.fps);
+        if (ctrl_rc == UVC_SUCCESS) {
+            chosen = &attempt;
+            break;
+        }
+    }
+    if (chosen == nullptr) {
+        emit_state("error", "No compatible UVC stream profile.");
+        return false;
+    }
+
+    const uvc_error_t stream_rc = uvc_start_streaming(g_uvc_devh, &ctrl, on_uvc_frame, nullptr, 0);
+    if (stream_rc != UVC_SUCCESS) {
+        std::ostringstream out;
+        out << "uvc_start_streaming failed: " << stream_rc;
+        emit_state("error", out.str());
+        return false;
+    }
+
+    start_usb_events_locked();
+    g_stream_frame_count.store(0, std::memory_order_relaxed);
+    g_stream_byte_count.store(0, std::memory_order_relaxed);
+    g_uvc_streaming.store(true);
+
+    std::ostringstream msg;
+    msg << "Native UVC stream active (" << chosen->label << ").";
+    emit_state("connected", msg.str());
+    return true;
+}
+
 void worker_loop() {
     emit_state("running", "Native tracker started (mock telemetry).");
+    const auto t0 = std::chrono::steady_clock::now();
+    auto last_stream_report = t0;
     int frame = 0;
     while (g_running.load()) {
         const double t = frame * 0.07;
@@ -91,8 +270,15 @@ void worker_loop() {
 
         const double err_x = cx - 0.5;
         const double err_y = cy - 0.5;
-        const double pan = -(kp_x * err_x + kd_x * err_x * 0.5f);
-        const double tilt = -(kp_y * err_y + kd_y * err_y * 0.5f);
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms_since_start = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count();
+        // Keep first second motionless, then ramp to full authority over the next second.
+        double ramp = 0.0;
+        if (ms_since_start > 1000) {
+            ramp = std::min(1.0, (ms_since_start - 1000) / 1000.0);
+        }
+        const double pan = ramp * (-(kp_x * err_x + kd_x * err_x * 0.5f));
+        const double tilt = ramp * (-(kp_y * err_y + kd_y * err_y * 0.5f));
         const double fps = 15.0;
         const double latency_ms = 18.0 + 4.0 * std::abs(std::sin(t));
 
@@ -102,6 +288,25 @@ void worker_loop() {
         telemetry << "{\"fps\":" << fps << ",\"latencyMs\":" << latency_ms << ",\"pan\":" << pan
                   << ",\"tilt\":" << tilt << "}";
         send_event("telemetry", telemetry.str());
+
+        const auto stream_now = std::chrono::steady_clock::now();
+        const auto stream_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(stream_now - last_stream_report).count();
+        if (stream_elapsed_ms >= 1000) {
+            const uint64_t frames =
+                g_stream_frame_count.exchange(0, std::memory_order_relaxed);
+            const uint64_t bytes =
+                g_stream_byte_count.exchange(0, std::memory_order_relaxed);
+            const double kbps =
+                stream_elapsed_ms > 0 ? (static_cast<double>(bytes) * 8.0 / stream_elapsed_ms) : 0.0;
+            std::ostringstream stream;
+            stream.setf(std::ios::fixed);
+            stream.precision(3);
+            stream << "{\"frames\":" << frames << ",\"bytes\":" << bytes << ",\"kbps\":" << kbps
+                   << ",\"source\":\"libuvc\"}";
+            send_event("stream", stream.str());
+            last_stream_report = stream_now;
+        }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(67));
         ++frame;
@@ -128,12 +333,27 @@ Java_com_example_insta360link_1android_1test_MainActivity_nativeAttachUsbFd(
     g_usb_fd = fd;
     g_usb_vid = vid;
     g_usb_pid = pid;
+    const bool ok = init_uvc_from_fd_locked(g_usb_fd);
 
     std::ostringstream msg;
-    msg << "{\"status\":\"connected\",\"message\":\"USB attached (fd=" << g_usb_fd << ", vid=0x"
-        << std::hex << g_usb_vid << ", pid=0x" << g_usb_pid << ").\"}";
+    msg << "{\"status\":\"" << (ok ? "connected" : "error") << "\",\"message\":\"USB attached (fd="
+        << g_usb_fd << ", vid=0x" << std::hex << g_usb_vid << ", pid=0x" << g_usb_pid
+        << ", nativeUvc=" << (ok ? "ok" : "failed") << ").\"}";
     send_event("state", msg.str());
-    return JNI_TRUE;
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_insta360link_1android_1test_MainActivity_nativeActivateCamera(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_usb_fd < 0) {
+        emit_state("error", "No USB device attached.");
+        return JNI_FALSE;
+    }
+    if (g_uvc_devh == nullptr && !init_uvc_from_fd_locked(g_usb_fd)) {
+        return JNI_FALSE;
+    }
+    return start_uvc_stream_locked() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -142,6 +362,7 @@ Java_com_example_insta360link_1android_1test_MainActivity_nativeDetachUsb(JNIEnv
     g_usb_fd = -1;
     g_usb_vid = 0;
     g_usb_pid = 0;
+    shutdown_uvc_locked();
     return JNI_TRUE;
 }
 
@@ -151,6 +372,12 @@ Java_com_example_insta360link_1android_1test_MainActivity_nativeStartTracking(JN
         std::lock_guard<std::mutex> lock(g_state_mutex);
         if (g_usb_fd < 0) {
             emit_state("error", "No USB device attached.");
+            return JNI_FALSE;
+        }
+        if (g_uvc_devh == nullptr && !init_uvc_from_fd_locked(g_usb_fd)) {
+            return JNI_FALSE;
+        }
+        if (!start_uvc_stream_locked()) {
             return JNI_FALSE;
         }
     }
@@ -238,6 +465,7 @@ Java_com_example_insta360link_1android_1test_MainActivity_nativeDispose(JNIEnv *
         g_usb_fd = -1;
         g_usb_vid = 0;
         g_usb_pid = 0;
+        shutdown_uvc_locked();
     }
     emit_state("idle", "Native tracker disposed.");
     return JNI_TRUE;
