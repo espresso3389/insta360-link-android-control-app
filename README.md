@@ -25,13 +25,13 @@ Copy to app assets directory; `android/app/src/main/assets/models/`
 
 Or push to device fallback path:
 
-```powershell
-adb push .\yolov8n-face_float32.tflite /sdcard/Download/yolov8n-face.tflite
+```sh
+adb push yolov8n-face_float32.tflite /sdcard/Download/yolov8n-face.tflite
 ```
 
 ### Manual build (.pt -> .tflite)
 
-```powershell
+```sh
 # 1) Create Python 3.11 env for export
 uv python install 3.11
 uv venv .modelbuild\venv --python 3.11
@@ -62,14 +62,14 @@ You can drive the app without touching the UI by sending commands to `MainActivi
 
 ### Build/install
 
-```powershell
+```sh
 flutter build apk --debug
 adb install -r build\app\outputs\flutter-apk\app-debug.apk
 ```
 
 ### Direct commands
 
-```powershell
+```sh
 # Initialize
 adb shell am start -n com.example.insta360link_android_test/.MainActivity --es cmd init
 
