@@ -1,4 +1,5 @@
 import "dart:async";
+import "dart:typed_data";
 
 import "package:flutter/services.dart";
 
@@ -117,6 +118,13 @@ class InstaLinkTracker {
       },
     );
     return result ?? false;
+  }
+
+  Future<Uint8List?> getPreviewJpeg() async {
+    final Uint8List? data = await _methodChannel.invokeMethod<Uint8List>(
+      "getPreviewJpeg",
+    );
+    return data;
   }
 
   Future<bool> dispose() async {

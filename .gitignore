@@ -43,3 +43,11 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# tflite build artifacts
+*.onnx
+*.pt
+*.tflite
+yolov8n-face_saved_model/
+calibration_image_sample_data_20x128x128x3_float32.npy
+.modelbuild/

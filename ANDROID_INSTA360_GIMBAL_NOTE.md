@@ -100,6 +100,10 @@ Current behavior:
 
 This was required because deadzone filtering previously caused "center" to be ignored.
 
+### Direction convention
+- Left/Right movement is defined in **camera-perspective** (camera's own left/right), not mirror/selfie perspective.
+- Keep this in mind when labeling UI controls and evaluating tracking behavior.
+
 ---
 
 ## 5) ADB Commands (Current Useful Set)

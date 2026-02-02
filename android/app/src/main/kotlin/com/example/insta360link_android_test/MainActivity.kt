@@ -15,6 +15,7 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.hardware.usb.UsbRequest
+import android.media.Image
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -39,6 +40,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventChannel.StreamHandler {
@@ -74,6 +77,40 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private var autoReconnectEnabled = true
     private var lastTargetVid = -1
     private var lastTargetPid = -1
+    private var trackingEnabled = false
+    private var yoloTracker: YoloV8FaceTracker? = null
+    private var yoloInitFailureNotified = false
+    private var lastInferenceMs = 0L
+    private var lastTelemetryMs = 0L
+    private var lastAutoGimbalMs = 0L
+    private var lastNoFaceNoticeMs = 0L
+    private var lastErrX = 0f
+    private var lastErrY = 0f
+    private var lastFaceCx = 0.5f
+    private var lastFaceCy = 0.5f
+    private var lastFaceMs = 0L
+    private var pidKpX = -1.20f
+    private var pidKiX = 0f
+    private var pidKdX = -0.12f
+    private var pidKpY = 1.00f
+    private var pidKiY = 0f
+    private var pidKdY = 0.10f
+    private var errIntX = 0f
+    private var errIntY = 0f
+    private var filteredPan = 0f
+    private var filteredTilt = 0f
+    private val yoloPollIntervalMs = 180L
+    private val yoloPollRunnable =
+        object : Runnable {
+            override fun run() {
+                if (!trackingEnabled) {
+                    return
+                }
+                val now = System.currentTimeMillis()
+                processNativeYuyvFrameForTracking(now)
+                mainHandler.postDelayed(this, yoloPollIntervalMs)
+            }
+        }
 
     private external fun nativeInit(): Boolean
     private external fun nativeAttachUsbFd(fd: Int, vid: Int, pid: Int): Boolean
@@ -93,6 +130,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private external fun nativeSetTargetPolicy(mode: String): Boolean
     private external fun nativeManualControl(pan: Float, tilt: Float, durationMs: Int): Boolean
     private external fun nativeDispose(): Boolean
+    private external fun nativeGetLatestYuyvFrame(): ByteArray?
+    private external fun nativeGetLatestFrameWidth(): Int
+    private external fun nativeGetLatestFrameHeight(): Int
+    private external fun nativeGetLatestFrameFormat(): Int
 
     private val usbPermissionReceiver =
         object : BroadcastReceiver() {
@@ -217,13 +258,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             }
 
             "startTracking" -> {
-                if (!isCameraActive && !activateCameraStreamInterface()) {
-                    result.success(false)
-                } else {
-                    result.success(nativeStartTracking())
-                }
+                result.success(startTrackingPipeline())
             }
-            "stopTracking" -> result.success(nativeStopTracking())
+            "stopTracking" -> result.success(stopTrackingPipeline())
             "setPid" -> {
                 val args = call.arguments as? Map<*, *>
                 val kpX = (args?.get("kpX") as? Number)?.toFloat() ?: 0f
@@ -232,6 +269,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                 val kpY = (args?.get("kpY") as? Number)?.toFloat() ?: 0f
                 val kiY = (args?.get("kiY") as? Number)?.toFloat() ?: 0f
                 val kdY = (args?.get("kdY") as? Number)?.toFloat() ?: 0f
+                pidKpX = kpX
+                pidKiX = kiX
+                pidKdX = kdX
+                pidKpY = kpY
+                pidKiY = kiY
+                pidKdY = kdY
                 result.success(nativeSetPid(kpX, kiX, kdX, kpY, kiY, kdY))
             }
 
@@ -263,6 +306,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             "activateCamera" -> result.success(activateCameraStreamInterface())
             "activateCamera2" -> result.success(activateCameraWithCamera2())
             "reconnect" -> result.success(reconnectLastDevice())
+            "getPreviewJpeg" -> result.success(getPreviewJpegFrame())
 
             "dispose" -> {
                 stopAndDetachUsb()
@@ -271,6 +315,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
 
             else -> result.notImplemented()
         }
+    }
+
+    private fun getPreviewJpegFrame(): ByteArray? {
+        val format = nativeGetLatestFrameFormat()
+        if (format != 2) {
+            return null
+        }
+        return nativeGetLatestYuyvFrame()
     }
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -453,6 +505,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     }
 
     private fun stopAndDetachUsb() {
+        trackingEnabled = false
+        mainHandler.removeCallbacks(yoloPollRunnable)
         stopCamera2Pipeline()
         stopStreamReader()
         nativeStopTracking()
@@ -465,6 +519,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         isCameraActive = false
         currentPanAbs = 0
         currentTiltAbs = 0
+        runCatching { yoloTracker?.close() }
+        yoloTracker = null
+        yoloInitFailureNotified = false
     }
 
     private fun handleAdbControlIntent(incoming: Intent?) {
@@ -484,12 +541,28 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             }
 
             "start" -> {
-                if (!isCameraActive && !activateCameraStreamInterface()) {
-                    return
-                }
-                nativeStartTracking()
+                startTrackingPipeline()
             }
-            "stop" -> nativeStopTracking()
+            "stop" -> stopTrackingPipeline()
+            "setpid" -> {
+                val kpX = incoming.getFloatExtra("kpX", pidKpX)
+                val kiX = incoming.getFloatExtra("kiX", pidKiX)
+                val kdX = incoming.getFloatExtra("kdX", pidKdX)
+                val kpY = incoming.getFloatExtra("kpY", pidKpY)
+                val kiY = incoming.getFloatExtra("kiY", pidKiY)
+                val kdY = incoming.getFloatExtra("kdY", pidKdY)
+                pidKpX = kpX
+                pidKiX = kiX
+                pidKdX = kdX
+                pidKpY = kpY
+                pidKiY = kiY
+                pidKdY = kdY
+                nativeSetPid(kpX, kiX, kdX, kpY, kiY, kdY)
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"ready","message":"PID updated kpX=$kpX kiX=$kiX kdX=$kdX kpY=$kpY kiY=$kiY kdY=$kdY"}""",
+                )
+            }
             "detach" -> stopAndDetachUsb()
             "policy" -> {
                 val mode = incoming.getStringExtra("mode") ?: "largest"
@@ -834,7 +907,222 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         return ok
     }
 
+    private fun startTrackingPipeline(): Boolean {
+        val nativeStreamOk = activateCameraStreamInterface()
+        if (!nativeStreamOk) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"Native UVC stream activation failed. Cannot run libuvc tracking."}""",
+            )
+            return false
+        }
+        val nativeTrackerOk = nativeStartTracking()
+        if (!nativeTrackerOk) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"Native tracking worker failed to start."}""",
+            )
+            return false
+        }
+        if (ensureYoloTracker() == null) {
+            trackingEnabled = false
+            return false
+        }
+        trackingEnabled = true
+        lastInferenceMs = 0L
+        lastTelemetryMs = 0L
+        lastAutoGimbalMs = 0L
+        lastNoFaceNoticeMs = 0L
+        lastErrX = 0f
+        lastErrY = 0f
+        lastFaceCx = 0.5f
+        lastFaceCy = 0.5f
+        lastFaceMs = 0L
+        errIntX = 0f
+        errIntY = 0f
+        filteredPan = 0f
+        filteredTilt = 0f
+        mainHandler.removeCallbacks(yoloPollRunnable)
+        mainHandler.post(yoloPollRunnable)
+
+        val msg =
+            "Tracking started (libuvc YUYV + YOLOv8n-face + gimbal)."
+        dispatchNativeEvent("state", """{"status":"running","message":"$msg"}""")
+        return true
+    }
+
+    private fun stopTrackingPipeline(): Boolean {
+        trackingEnabled = false
+        mainHandler.removeCallbacks(yoloPollRunnable)
+        errIntX = 0f
+        errIntY = 0f
+        filteredPan = 0f
+        filteredTilt = 0f
+        lastFaceMs = 0L
+        nativeStopTracking()
+        dispatchNativeEvent("state", """{"status":"connected","message":"Tracking stopped."}""")
+        return true
+    }
+
+    private fun ensureYoloTracker(): YoloV8FaceTracker? {
+        val existing = yoloTracker
+        if (existing != null) {
+            return existing
+        }
+        return try {
+            val tracker =
+                YoloV8FaceTracker.create(
+                    assets,
+                    modelAssetCandidates =
+                        listOf(
+                            "models/yolov8n-face.tflite",
+                            "models/yolov8n_face.tflite",
+                            "yolov8n-face.tflite",
+                        ),
+                    modelFileCandidates =
+                        listOf(
+                            "/sdcard/Download/yolov8n-face.tflite",
+                            "/sdcard/Download/yolov8n_face.tflite",
+                        ),
+                    inputSize = 320,
+                    threads = 4,
+                )
+            yoloTracker = tracker
+            yoloInitFailureNotified = false
+            dispatchNativeEvent("state", """{"status":"ready","message":"YOLOv8n-face TFLite model loaded."}""")
+            tracker
+        } catch (t: Throwable) {
+            if (!yoloInitFailureNotified) {
+                yoloInitFailureNotified = true
+                val msg =
+                    (t.message ?: "unknown").replace("\"", "'")
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"error","message":"Failed to load YOLOv8n-face model. Put yolov8n-face.tflite in android/app/src/main/assets/models/ or /sdcard/Download/. detail=$msg"}""",
+                )
+            }
+            null
+        }
+    }
+
+    private fun processNativeYuyvFrameForTracking(nowMs: Long) {
+        if (!trackingEnabled) {
+            return
+        }
+        if (nowMs - lastInferenceMs < 120) {
+            return
+        }
+        lastInferenceMs = nowMs
+
+        val detector = ensureYoloTracker() ?: return
+        val w = nativeGetLatestFrameWidth()
+        val h = nativeGetLatestFrameHeight()
+        val format = nativeGetLatestFrameFormat()
+        val frame = nativeGetLatestYuyvFrame()
+        if (frame == null || w <= 0 || h <= 0) {
+            return
+        }
+        val t0 = System.nanoTime()
+        val detection =
+            try {
+                when (format) {
+                    1 -> detector.detectLargestYuyv(frame, w, h)
+                    2 -> detector.detectLargestMjpeg(frame)
+                    else -> null
+                }
+            } catch (t: Throwable) {
+                Log.e(tag, "YOLO inference failed", t)
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"error","message":"YOLO inference failed: ${t.message ?: "unknown"}"}""",
+                )
+                null
+            }
+        val latencyMs = (System.nanoTime() - t0) / 1_000_000.0
+        val hasDetection = detection != null
+        var faceCx = lastFaceCx
+        var faceCy = lastFaceCy
+        if (hasDetection) {
+            faceCx = detection!!.cx
+            faceCy = detection.cy
+            lastFaceCx = faceCx
+            lastFaceCy = faceCy
+            lastFaceMs = nowMs
+        } else if (nowMs - lastFaceMs <= 900) {
+            // Keep short-term continuity when one or two detections drop.
+            faceCx = (lastFaceCx * 0.995f + 0.5f * 0.005f)
+            faceCy = (lastFaceCy * 0.995f + 0.5f * 0.005f)
+            lastFaceCx = faceCx
+            lastFaceCy = faceCy
+        } else {
+            if (nowMs - lastNoFaceNoticeMs > 2500) {
+                lastNoFaceNoticeMs = nowMs
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"ready","message":"YOLO running but no face candidate yet. Move closer / center your face / improve lighting."}""",
+                )
+            }
+            return
+        }
+
+        if (hasDetection) {
+            dispatchEvent(
+                mapOf(
+                    "type" to "face",
+                    "x" to detection!!.x.toDouble(),
+                    "y" to detection.y.toDouble(),
+                    "w" to detection.w.toDouble(),
+                    "h" to detection.h.toDouble(),
+                    "score" to detection.score.toDouble(),
+                    "source" to "yolov8n-face-tflite-libuvc",
+                ),
+            )
+        }
+
+        val errX = faceCx - 0.5f
+        val errY = faceCy - 0.5f
+        val dt = max(0.05f, (nowMs - lastTelemetryMs).coerceAtLeast(1).toFloat() / 1000f)
+        errIntX += errX * dt
+        errIntY += errY * dt
+        errIntX = errIntX.coerceIn(-1f, 1f)
+        errIntY = errIntY.coerceIn(-1f, 1f)
+        val dErrX = (errX - lastErrX) / dt
+        val dErrY = (errY - lastErrY) / dt
+        lastErrX = errX
+        lastErrY = errY
+
+        val panCmd = (-(pidKpX * errX + pidKiX * errIntX + pidKdX * dErrX)).coerceIn(-0.60f, 0.60f)
+        val tiltCmd = (-(pidKpY * errY + pidKiY * errIntY + pidKdY * dErrY)).coerceIn(-0.45f, 0.45f)
+        filteredPan = (filteredPan * 0.72f + panCmd * 0.28f).coerceIn(-0.60f, 0.60f)
+        filteredTilt = (filteredTilt * 0.72f + tiltCmd * 0.28f).coerceIn(-0.45f, 0.45f)
+        val panOut = if (abs(filteredPan) < 0.05f) 0f else filteredPan
+        val tiltOut = if (abs(filteredTilt) < 0.05f) 0f else filteredTilt
+        val fps = if (dt > 0f) (1f / dt) else 0f
+
+        dispatchEvent(
+            mapOf(
+                "type" to "telemetry",
+                "fps" to fps.toDouble(),
+                "latencyMs" to latencyMs,
+                "pan" to panOut.toDouble(),
+                "tilt" to tiltOut.toDouble(),
+                "source" to "yolov8n-face-tflite-libuvc",
+            ),
+        )
+        lastTelemetryMs = nowMs
+
+        if (nowMs - lastAutoGimbalMs < 220) {
+            return
+        }
+        lastAutoGimbalMs = nowMs
+        sendManualGimbalCommand(panOut, tiltOut, 240)
+    }
+
     private fun activateCameraWithCamera2(): Boolean {
+        if (captureSession != null && cameraDevice != null && imageReader != null) {
+            isCameraActive = true
+            return true
+        }
         if (!ensureCameraPermission()) {
             dispatchNativeEvent(
                 "state",
@@ -1025,6 +1313,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         imageReader = null
         cameraFramesSinceReport = 0
         cameraLastReportMs = 0
+        lastInferenceMs = 0
+        lastTelemetryMs = 0
+        lastAutoGimbalMs = 0
         stopCameraThread()
     }
 
@@ -1357,7 +1648,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         val tiltMax = 360000
 
         // Use the exact Linux-captured tuple:
-        // bmRequestType=0x21, bRequest=0x01, wValue=0x0d00, wIndex=0x0100, 8-byte payload [pan_i32_le, tilt_i32_le]
+        // bmRequestType=0x21, bRequest=0x01, wValue=0x0d00, wIndex=0x0100, 8-byte payload [pan_i32_le, tilt_i32_le].
+        // Direction convention here is camera-perspective (camera's left/right), not mirrored user-perspective.
         val panStep = (pan.coerceIn(-1f, 1f) * 90000f).roundToInt()
         val tiltStep = (tilt.coerceIn(-1f, 1f) * 68400f).roundToInt()
         currentPanAbs = (currentPanAbs + panStep).coerceIn(panMin, panMax)

@@ -1,14 +1,14 @@
 #include <jni.h>
 
 #include <atomic>
-#include <algorithm>
 #include <chrono>
-#include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <libusb.h>
 #include <libuvc/libuvc.h>
@@ -33,6 +33,11 @@ std::atomic<uint64_t> g_stream_frame_count{0};
 std::atomic<uint64_t> g_stream_byte_count{0};
 std::atomic<bool> g_usb_events_running{false};
 std::thread g_usb_events_thread;
+std::mutex g_frame_mutex;
+std::vector<uint8_t> g_latest_yuyv;
+int g_latest_width = 0;
+int g_latest_height = 0;
+int g_latest_format = 0; // 0=none, 1=YUYV, 2=MJPEG
 
 float g_kp_x = 0.015f;
 float g_ki_x = 0.0f;
@@ -78,6 +83,16 @@ void on_uvc_frame(uvc_frame_t * frame, void *) {
     }
     g_stream_frame_count.fetch_add(1, std::memory_order_relaxed);
     g_stream_byte_count.fetch_add(static_cast<uint64_t>(frame->data_bytes), std::memory_order_relaxed);
+    if ((frame->frame_format == UVC_FRAME_FORMAT_YUYV || frame->frame_format == UVC_FRAME_FORMAT_MJPEG) &&
+        frame->data != nullptr &&
+        frame->data_bytes > 0) {
+        std::lock_guard<std::mutex> lock(g_frame_mutex);
+        g_latest_width = static_cast<int>(frame->width);
+        g_latest_height = static_cast<int>(frame->height);
+        g_latest_yuyv.resize(frame->data_bytes);
+        std::memcpy(g_latest_yuyv.data(), frame->data, frame->data_bytes);
+        g_latest_format = (frame->frame_format == UVC_FRAME_FORMAT_YUYV) ? 1 : 2;
+    }
 }
 
 void stop_usb_events_locked() {
@@ -132,6 +147,13 @@ void shutdown_uvc_locked() {
     }
     g_stream_frame_count.store(0, std::memory_order_relaxed);
     g_stream_byte_count.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_frame_mutex);
+        g_latest_yuyv.clear();
+        g_latest_width = 0;
+        g_latest_height = 0;
+        g_latest_format = 0;
+    }
 }
 
 bool init_uvc_from_fd_locked(int fd) {
@@ -190,10 +212,10 @@ bool start_uvc_stream_locked() {
         const char * label;
     };
     const Attempt attempts[] = {
+        {UVC_FRAME_FORMAT_YUYV, 640, 480, 30, "yuyv_480p30"},
         {UVC_FRAME_FORMAT_MJPEG, 1920, 1080, 30, "mjpeg_1080p30"},
         {UVC_FRAME_FORMAT_MJPEG, 1280, 720, 30, "mjpeg_720p30"},
         {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, "mjpeg_480p30"},
-        {UVC_FRAME_FORMAT_YUYV, 640, 480, 30, "yuyv_480p30"},
         {UVC_FRAME_FORMAT_ANY, 640, 480, 30, "any_480p30"},
     };
 
@@ -237,58 +259,9 @@ bool start_uvc_stream_locked() {
 }
 
 void worker_loop() {
-    emit_state("running", "Native tracker started (mock telemetry).");
-    const auto t0 = std::chrono::steady_clock::now();
-    auto last_stream_report = t0;
-    int frame = 0;
+    emit_state("running", "Native tracking loop started (stream telemetry only).");
+    auto last_stream_report = std::chrono::steady_clock::now();
     while (g_running.load()) {
-        const double t = frame * 0.07;
-        const double cx = 0.45 + 0.15 * std::sin(t);
-        const double cy = 0.35 + 0.10 * std::cos(t * 0.8);
-        const double w = 0.20;
-        const double h = 0.25;
-        const double score = 0.92;
-
-        std::ostringstream face;
-        face.setf(std::ios::fixed);
-        face.precision(4);
-        face << "{\"x\":" << cx << ",\"y\":" << cy << ",\"w\":" << w << ",\"h\":" << h
-             << ",\"score\":" << score << "}";
-        send_event("face", face.str());
-
-        float kp_x;
-        float kd_x;
-        float kp_y;
-        float kd_y;
-        {
-            std::lock_guard<std::mutex> lock(g_state_mutex);
-            kp_x = g_kp_x;
-            kd_x = g_kd_x;
-            kp_y = g_kp_y;
-            kd_y = g_kd_y;
-        }
-
-        const double err_x = cx - 0.5;
-        const double err_y = cy - 0.5;
-        const auto now = std::chrono::steady_clock::now();
-        const auto ms_since_start = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count();
-        // Keep first second motionless, then ramp to full authority over the next second.
-        double ramp = 0.0;
-        if (ms_since_start > 1000) {
-            ramp = std::min(1.0, (ms_since_start - 1000) / 1000.0);
-        }
-        const double pan = ramp * (-(kp_x * err_x + kd_x * err_x * 0.5f));
-        const double tilt = ramp * (-(kp_y * err_y + kd_y * err_y * 0.5f));
-        const double fps = 15.0;
-        const double latency_ms = 18.0 + 4.0 * std::abs(std::sin(t));
-
-        std::ostringstream telemetry;
-        telemetry.setf(std::ios::fixed);
-        telemetry.precision(3);
-        telemetry << "{\"fps\":" << fps << ",\"latencyMs\":" << latency_ms << ",\"pan\":" << pan
-                  << ",\"tilt\":" << tilt << "}";
-        send_event("telemetry", telemetry.str());
-
         const auto stream_now = std::chrono::steady_clock::now();
         const auto stream_elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(stream_now - last_stream_report).count();
@@ -308,8 +281,7 @@ void worker_loop() {
             last_stream_report = stream_now;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(67));
-        ++frame;
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
     }
     emit_state("connected", "Native tracker stopped.");
 }
@@ -469,6 +441,44 @@ Java_com_example_insta360link_1android_1test_MainActivity_nativeDispose(JNIEnv *
     }
     emit_state("idle", "Native tracker disposed.");
     return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_example_insta360link_1android_1test_MainActivity_nativeGetLatestYuyvFrame(
+    JNIEnv * env,
+    jobject) {
+    std::lock_guard<std::mutex> lock(g_frame_mutex);
+    if (g_latest_yuyv.empty()) {
+        return nullptr;
+    }
+    jbyteArray out = env->NewByteArray(static_cast<jsize>(g_latest_yuyv.size()));
+    if (out == nullptr) {
+        return nullptr;
+    }
+    env->SetByteArrayRegion(
+        out,
+        0,
+        static_cast<jsize>(g_latest_yuyv.size()),
+        reinterpret_cast<const jbyte *>(g_latest_yuyv.data()));
+    return out;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_insta360link_1android_1test_MainActivity_nativeGetLatestFrameWidth(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_frame_mutex);
+    return static_cast<jint>(g_latest_width);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_insta360link_1android_1test_MainActivity_nativeGetLatestFrameHeight(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_frame_mutex);
+    return static_cast<jint>(g_latest_height);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_insta360link_1android_1test_MainActivity_nativeGetLatestFrameFormat(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_frame_mutex);
+    return static_cast<jint>(g_latest_format);
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void *) {

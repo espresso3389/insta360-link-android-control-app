@@ -1,4 +1,5 @@
 import "dart:async";
+import "dart:typed_data";
 
 import "package:flutter/material.dart";
 
@@ -15,6 +16,7 @@ class _TrackingPageState extends State<TrackingPage> {
   final InstaLinkTracker _tracker = InstaLinkTracker();
 
   StreamSubscription<Map<String, dynamic>>? _eventSub;
+  Timer? _previewTimer;
   List<Map<String, dynamic>> _devices = <Map<String, dynamic>>[];
   String _status = "idle";
   String _message = "Press Initialize to start.";
@@ -33,25 +35,40 @@ class _TrackingPageState extends State<TrackingPage> {
   int _streamBytes = 0;
   String _streamSource = "uvc";
   String _connectedDeviceName = "-";
+  Uint8List? _previewJpeg;
 
-  double _kpX = 0.015;
+  double _kpX = -1.20;
   double _kiX = 0;
-  double _kdX = 0.004;
-  double _kpY = 0.015;
+  double _kdX = -0.12;
+  double _kpY = 1.00;
   double _kiY = 0;
-  double _kdY = 0.004;
+  double _kdY = 0.10;
 
   @override
   void initState() {
     super.initState();
     _eventSub = _tracker.events.listen(_onEvent);
+    _previewTimer = Timer.periodic(const Duration(milliseconds: 220), (_) {
+      unawaited(_refreshPreviewFrame());
+    });
   }
 
   @override
   void dispose() {
+    _previewTimer?.cancel();
     _eventSub?.cancel();
     _tracker.dispose();
     super.dispose();
+  }
+
+  Future<void> _refreshPreviewFrame() async {
+    final Uint8List? frame = await _tracker.getPreviewJpeg();
+    if (!mounted || frame == null || frame.isEmpty) {
+      return;
+    }
+    setState(() {
+      _previewJpeg = frame;
+    });
   }
 
   void _onEvent(Map<String, dynamic> event) {
@@ -79,7 +96,8 @@ class _TrackingPageState extends State<TrackingPage> {
         _streamSource = (event["source"] ?? _streamSource).toString();
       }
     });
-    if (type == "telemetry") {
+    if (type == "telemetry" &&
+        !(event["source"] ?? "").toString().startsWith("yolov8n-face-tflite")) {
       unawaited(_maybeSendTrackingGimbal(_pan, _tilt, _fps));
     }
   }
@@ -250,7 +268,7 @@ class _TrackingPageState extends State<TrackingPage> {
             Expanded(
               child: Row(
                 children: <Widget>[
-                  Expanded(child: _PreviewCard(face: _face)),
+                  Expanded(child: _PreviewCard(face: _face, jpegFrame: _previewJpeg)),
                   const SizedBox(width: 12),
                   SizedBox(
                     width: 320,
@@ -334,7 +352,7 @@ class _TrackingPageState extends State<TrackingPage> {
             ),
             const SizedBox(height: 8),
             Text(
-              "Tip: native layer currently emits mock telemetry. Replace with libuvc + YOLOv8n-face + gimbal controls.",
+              "Tip: Start Tracking uses libuvc stream + YOLOv8n-face TFLite and drives gimbal via UVC PTZ.",
               style: theme.textTheme.bodySmall,
             ),
           ],
@@ -366,9 +384,10 @@ class _StatusCard extends StatelessWidget {
 }
 
 class _PreviewCard extends StatelessWidget {
-  const _PreviewCard({required this.face});
+  const _PreviewCard({required this.face, required this.jpegFrame});
 
   final Map<String, dynamic>? face;
+  final Uint8List? jpegFrame;
 
   @override
   Widget build(BuildContext context) {
@@ -380,12 +399,19 @@ class _PreviewCard extends StatelessWidget {
           fit: StackFit.expand,
           children: <Widget>[
             Container(color: Colors.black),
-            const Center(
-              child: Text(
-                "Native UVC preview hook",
-                style: TextStyle(color: Colors.white70),
+            if (jpegFrame != null)
+              Image.memory(
+                jpegFrame!,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+              )
+            else
+              const Center(
+                child: Text(
+                  "Waiting preview frame...",
+                  style: TextStyle(color: Colors.white70),
+                ),
               ),
-            ),
             CustomPaint(painter: _FacePainter(face: face)),
           ],
         ),
@@ -528,6 +554,11 @@ class _GimbalCard extends StatelessWidget {
             const Text(
               "Gimbal Presets",
               style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              "Direction is camera-perspective (camera's left/right), not mirror-selfie perspective.",
+              style: TextStyle(fontSize: 12, color: Colors.black54),
             ),
             const SizedBox(height: 8),
             SwitchListTile(
