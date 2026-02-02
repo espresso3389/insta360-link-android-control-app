@@ -22,7 +22,7 @@ class _TrackingPageState extends State<TrackingPage> {
   List<Map<String, dynamic>> _devices = <Map<String, dynamic>>[];
   String _status = "idle";
   String _message = "Press Initialize to start.";
-  bool _isRunning = false;
+  bool _trackingActive = false;
   _ControlMode _mode = _ControlMode.automatic;
   int _lastGimbalCmdMs = 0;
 
@@ -83,10 +83,7 @@ class _TrackingPageState extends State<TrackingPage> {
       if (type == "state") {
         _status = (event["status"] ?? _status).toString();
         _message = (event["message"] ?? _message).toString();
-        _isRunning = _status == "running";
-        if (_isRunning) {
-          _mode = _ControlMode.automatic;
-        }
+        // Keep mode explicit; do not auto-flip manual mode on status events.
       } else if (type == "telemetry") {
         _fps = _asDouble(event["fps"], _fps);
         _latencyMs = _asDouble(event["latencyMs"], _latencyMs);
@@ -114,7 +111,7 @@ class _TrackingPageState extends State<TrackingPage> {
     double tilt,
     double fps,
   ) async {
-    if (!_isRunning || _mode != _ControlMode.automatic || fps <= 0) {
+    if (!_trackingActive || _mode != _ControlMode.automatic || fps <= 0) {
       return;
     }
     final int now = DateTime.now().millisecondsSinceEpoch;
@@ -173,7 +170,7 @@ class _TrackingPageState extends State<TrackingPage> {
     setState(() {
       _mode = _ControlMode.automatic;
       _status = started ? "running" : "error";
-      _isRunning = started;
+      _trackingActive = started;
       _message = started ? "Automatic tracking active." : "Auto start failed.";
     });
   }
@@ -229,10 +226,10 @@ class _TrackingPageState extends State<TrackingPage> {
       kdY: _kdY,
     );
     final bool ok = await _tracker.startTracking();
+    _trackingActive = ok;
     if (!silent) {
       setState(() {
         _status = ok ? "running" : "error";
-        _isRunning = ok;
         _mode = ok ? _ControlMode.automatic : _mode;
         _message = ok ? "Automatic tracking active." : "Start failed.";
       });
@@ -242,10 +239,10 @@ class _TrackingPageState extends State<TrackingPage> {
 
   Future<bool> _stopTracking({bool silent = false}) async {
     final bool ok = await _tracker.stopTracking();
+    _trackingActive = false;
     if (!silent) {
       setState(() {
         _status = ok ? "connected" : "error";
-        _isRunning = false;
         _message = ok ? "Tracking stopped." : "Stop failed.";
       });
     }
@@ -262,12 +259,10 @@ class _TrackingPageState extends State<TrackingPage> {
   }
 
   Future<void> _enterManualMode() async {
-    if (_isRunning) {
-      await _stopTracking(silent: true);
-    }
+    await _stopTracking(silent: true);
     setState(() {
       _mode = _ControlMode.manual;
-      _isRunning = false;
+      _trackingActive = false;
       _status = "connected";
       _message = "Manual mode active. Press Automatic to resume face tracking.";
     });
@@ -320,15 +315,14 @@ class _TrackingPageState extends State<TrackingPage> {
                       children: <Widget>[
                         Expanded(
                           child: DefaultTabController(
-                            length: 4,
+                            length: 3,
                             child: Column(
                               children: <Widget>[
                                 const TabBar(
                                   isScrollable: true,
                                   tabs: <Widget>[
                                     Tab(text: "Gimbal"),
-                                    Tab(text: "Telemetry"),
-                                    Tab(text: "USB"),
+                                    Tab(text: "Status"),
                                     Tab(text: "PID"),
                                   ],
                                 ),
@@ -346,15 +340,11 @@ class _TrackingPageState extends State<TrackingPage> {
                                         ),
                                       ),
                                       SingleChildScrollView(
-                                        child: _TelemetryCard(
+                                        child: _StatusCard(
                                           fps: _fps,
                                           latencyMs: _latencyMs,
                                           pan: _pan,
                                           tilt: _tilt,
-                                        ),
-                                      ),
-                                      SingleChildScrollView(
-                                        child: _UsbHealthCard(
                                           connectedDeviceName: _connectedDeviceName,
                                           totalDevices: _devices.length,
                                           uvcDevices: _devices
@@ -606,45 +596,12 @@ class _GimbalCard extends StatelessWidget {
   }
 }
 
-class _TelemetryCard extends StatelessWidget {
-  const _TelemetryCard({
+class _StatusCard extends StatelessWidget {
+  const _StatusCard({
     required this.fps,
     required this.latencyMs,
     required this.pan,
     required this.tilt,
-  });
-
-  final double fps;
-  final double latencyMs;
-  final double pan;
-  final double tilt;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            const Text(
-              "Telemetry",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 6),
-            Text("FPS: ${fps.toStringAsFixed(1)}"),
-            Text("Latency: ${latencyMs.toStringAsFixed(1)} ms"),
-            Text("Pan: ${pan.toStringAsFixed(2)}"),
-            Text("Tilt: ${tilt.toStringAsFixed(2)}"),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _UsbHealthCard extends StatelessWidget {
-  const _UsbHealthCard({
     required this.connectedDeviceName,
     required this.totalDevices,
     required this.uvcDevices,
@@ -655,6 +612,10 @@ class _UsbHealthCard extends StatelessWidget {
     required this.streamBytes,
   });
 
+  final double fps;
+  final double latencyMs;
+  final double pan;
+  final double tilt;
   final String connectedDeviceName;
   final int totalDevices;
   final int uvcDevices;
@@ -673,10 +634,25 @@ class _UsbHealthCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
             const Text(
-              "USB Health",
+              "Status",
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 6),
+            const Text(
+              "Telemetry",
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 4),
+            Text("FPS: ${fps.toStringAsFixed(1)}"),
+            Text("Latency: ${latencyMs.toStringAsFixed(1)} ms"),
+            Text("Pan: ${pan.toStringAsFixed(2)}"),
+            Text("Tilt: ${tilt.toStringAsFixed(2)}"),
+            const SizedBox(height: 10),
+            const Text(
+              "USB",
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 4),
             Text("Connected: $connectedDeviceName"),
             Text("USB devices: $totalDevices (UVC: $uvcDevices)"),
             Text("Stream source: $streamSource"),

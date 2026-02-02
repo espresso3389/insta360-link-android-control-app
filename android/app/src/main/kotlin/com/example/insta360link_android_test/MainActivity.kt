@@ -89,7 +89,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private var lastErrY = 0f
     private var lastFaceCx = 0.5f
     private var lastFaceCy = 0.5f
+    private var lastFaceW = 0.0f
+    private var lastFaceH = 0.0f
     private var lastFaceMs = 0L
+    private var lastFaceMotionMs = 0L
     private var patrolMode = false
     private var patrolDirection = 1f
     private var lastPatrolCmdMs = 0L
@@ -534,6 +537,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         isCameraActive = false
         currentPanAbs = 0
         currentTiltAbs = 0
+        lastFaceMotionMs = 0L
         patrolMode = false
         patrolDirection = 1f
         lastPatrolCmdMs = 0L
@@ -964,7 +968,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         lastErrY = 0f
         lastFaceCx = 0.5f
         lastFaceCy = 0.5f
+        lastFaceW = 0.0f
+        lastFaceH = 0.0f
         lastFaceMs = 0L
+        lastFaceMotionMs = 0L
         patrolMode = false
         patrolDirection = 1f
         lastPatrolCmdMs = 0L
@@ -990,6 +997,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         filteredPan = 0f
         filteredTilt = 0f
         lastFaceMs = 0L
+        lastFaceW = 0.0f
+        lastFaceH = 0.0f
+        lastFaceMotionMs = 0L
         patrolMode = false
         patrolDirection = 1f
         lastPatrolCmdMs = 0L
@@ -1058,7 +1068,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             return
         }
         val t0 = System.nanoTime()
-        val detection =
+        var detection =
             try {
                 when (format) {
                     1 -> detector.detectLargestYuyv(frame, w, h)
@@ -1074,14 +1084,43 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                 null
             }
         val latencyMs = (System.nanoTime() - t0) / 1_000_000.0
-        val hasDetection = detection != null
+        var hasDetection = detection != null
         var faceCx = lastFaceCx
         var faceCy = lastFaceCy
         if (hasDetection) {
-            faceCx = detection!!.cx
-            faceCy = detection.cy
+            val det = detection!!
+            faceCx = det.cx
+            faceCy = det.cy
+            val area = (det.w * det.h).coerceAtLeast(0f)
+            val minFaceArea = 0.02f
+            if (area < minFaceArea) {
+                detection = null
+                hasDetection = false
+            } else {
+                val motionScore =
+                    kotlin.math.abs(faceCx - lastFaceCx) +
+                        kotlin.math.abs(faceCy - lastFaceCy) +
+                        kotlin.math.abs(det.w - lastFaceW) +
+                        kotlin.math.abs(det.h - lastFaceH)
+                if (motionScore >= 0.006f || lastFaceMotionMs == 0L) {
+                    lastFaceMotionMs = nowMs
+                }
+                val staticIgnoreArea = 0.08f
+                if (area < staticIgnoreArea && nowMs - lastFaceMotionMs > 1800) {
+                    detection = null
+                    hasDetection = false
+                }
+            }
+        }
+
+        if (hasDetection) {
+            val det = detection!!
+            faceCx = det.cx
+            faceCy = det.cy
             lastFaceCx = faceCx
             lastFaceCy = faceCy
+            lastFaceW = det.w
+            lastFaceH = det.h
             lastFaceMs = nowMs
             if (patrolMode) {
                 patrolMode = false
