@@ -67,6 +67,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private val tiltDeadzone = 0.08f
     private var currentPanAbs = 0
     private var currentTiltAbs = 0
+    private var currentZoomLevel = 0f
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
     private var cameraDevice: CameraDevice? = null
@@ -89,6 +90,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private var lastFaceCx = 0.5f
     private var lastFaceCy = 0.5f
     private var lastFaceMs = 0L
+    private var patrolMode = false
+    private var patrolDirection = 1f
+    private var lastPatrolCmdMs = 0L
+    private var lastPatrolNoticeMs = 0L
     private var pidKpX = -1.20f
     private var pidKiX = 0f
     private var pidKdX = -0.12f
@@ -301,6 +306,16 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                 val ok = sendManualGimbalCommand(pan, tilt, durationMs, force = isCenter)
                 nativeManualControl(pan, tilt, durationMs)
                 result.success(ok)
+            }
+            "manualZoom" -> {
+                val args = call.arguments as? Map<*, *>
+                val zoom = (args?.get("zoom") as? Number)?.toFloat() ?: 0f
+                val durationMs = (args?.get("durationMs") as? Number)?.toInt() ?: 300
+                if (!isCameraActive && !activateCameraStreamInterface()) {
+                    result.success(false)
+                    return
+                }
+                result.success(sendManualZoomCommand(zoom, durationMs))
             }
 
             "activateCamera" -> result.success(activateCameraStreamInterface())
@@ -519,6 +534,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         isCameraActive = false
         currentPanAbs = 0
         currentTiltAbs = 0
+        patrolMode = false
+        patrolDirection = 1f
+        lastPatrolCmdMs = 0L
+        lastPatrolNoticeMs = 0L
         runCatching { yoloTracker?.close() }
         yoloTracker = null
         yoloInitFailureNotified = false
@@ -583,6 +602,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                 }
                 sendManualGimbalCommand(pan, tilt, durationMs, force = isCenter)
                 nativeManualControl(pan, tilt, durationMs)
+            }
+            "zoom" -> {
+                val zoom = incoming.getFloatExtra("zoom", 0f)
+                val durationMs = incoming.getIntExtra("durationMs", 300)
+                if (!isCameraActive && !activateCameraStreamInterface()) {
+                    return
+                }
+                sendManualZoomCommand(zoom, durationMs)
             }
 
             "activate" -> activateCameraStreamInterface()
@@ -938,6 +965,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         lastFaceCx = 0.5f
         lastFaceCy = 0.5f
         lastFaceMs = 0L
+        patrolMode = false
+        patrolDirection = 1f
+        lastPatrolCmdMs = 0L
+        lastPatrolNoticeMs = 0L
         errIntX = 0f
         errIntY = 0f
         filteredPan = 0f
@@ -959,6 +990,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         filteredPan = 0f
         filteredTilt = 0f
         lastFaceMs = 0L
+        patrolMode = false
+        patrolDirection = 1f
+        lastPatrolCmdMs = 0L
+        lastPatrolNoticeMs = 0L
         nativeStopTracking()
         dispatchNativeEvent("state", """{"status":"connected","message":"Tracking stopped."}""")
         return true
@@ -1048,6 +1083,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             lastFaceCx = faceCx
             lastFaceCy = faceCy
             lastFaceMs = nowMs
+            if (patrolMode) {
+                patrolMode = false
+                lastPatrolCmdMs = 0L
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"running","message":"Face re-acquired. Returning to automatic tracking."}""",
+                )
+            }
         } else if (nowMs - lastFaceMs <= 900) {
             // Keep short-term continuity when one or two detections drop.
             faceCx = (lastFaceCx * 0.995f + 0.5f * 0.005f)
@@ -1055,6 +1098,61 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             lastFaceCx = faceCx
             lastFaceCy = faceCy
         } else {
+            val noFaceMs = nowMs - lastFaceMs
+            val patrolStartDelayMs = 1200L
+            if (noFaceMs >= patrolStartDelayMs) {
+                if (!patrolMode) {
+                    patrolMode = true
+                    patrolDirection = if (currentPanAbs >= 0) -1f else 1f
+                    lastPatrolCmdMs = 0L
+                    filteredPan = 0f
+                    filteredTilt = 0f
+                    errIntX = 0f
+                    errIntY = 0f
+                    lastErrX = 0f
+                    lastErrY = 0f
+                    dispatchNativeEvent(
+                        "state",
+                        """{"status":"running","message":"No face detected. Starting patrol scan mode."}""",
+                    )
+                }
+                if (currentPanAbs >= 480000) {
+                    patrolDirection = -1f
+                } else if (currentPanAbs <= -480000) {
+                    patrolDirection = 1f
+                }
+                val patrolPan = (0.34f * patrolDirection).coerceIn(-0.45f, 0.45f)
+                val patrolTilt =
+                    when {
+                        currentTiltAbs > 50000 -> -0.16f
+                        currentTiltAbs < -50000 -> 0.16f
+                        else -> 0f
+                    }
+                if (nowMs - lastPatrolCmdMs >= 420) {
+                    lastPatrolCmdMs = nowMs
+                    sendManualGimbalCommand(patrolPan, patrolTilt, 240)
+                }
+                dispatchEvent(
+                    mapOf(
+                        "type" to "telemetry",
+                        "fps" to 0.0,
+                        "latencyMs" to latencyMs,
+                        "pan" to patrolPan.toDouble(),
+                        "tilt" to patrolTilt.toDouble(),
+                        "patrol" to true,
+                        "source" to "yolov8n-face-tflite-libuvc",
+                    ),
+                )
+                if (nowMs - lastPatrolNoticeMs > 2500) {
+                    lastPatrolNoticeMs = nowMs
+                    dispatchNativeEvent(
+                        "state",
+                        """{"status":"ready","message":"Patrol scan active (no face yet)."}""",
+                    )
+                }
+                lastTelemetryMs = nowMs
+                return
+            }
             if (nowMs - lastNoFaceNoticeMs > 2500) {
                 lastNoFaceNoticeMs = nowMs
                 dispatchNativeEvent(
@@ -1685,6 +1783,40 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         dispatchNativeEvent(
             "state",
             """{"status":"error","message":"PTZ transfer failed on linux tuple path."}""",
+        )
+        return false
+    }
+
+    private fun sendManualZoomCommand(zoom: Float, durationMs: Int): Boolean {
+        val connection = usbConnection ?: return false
+        if (kotlin.math.abs(zoom) < 0.02f) {
+            return true
+        }
+        val direction: Byte = if (zoom > 0f) 1 else (-1).toByte()
+        val speed: Byte = (1 + (kotlin.math.abs(zoom).coerceIn(0f, 1f) * 7f).roundToInt()).toByte()
+        // UVC CT_ZOOM_RELATIVE_CONTROL (selector 0x0C), 3-byte payload [direction, digitalZoom, speed]
+        val payload = byteArrayOf(direction, 0, speed)
+        val rc =
+            connection.controlTransfer(
+                0x21,
+                0x01,
+                0x0C00,
+                0x0100,
+                payload,
+                payload.size,
+                durationMs.coerceIn(80, 2000),
+            )
+        currentZoomLevel = (currentZoomLevel + zoom * 0.1f).coerceIn(-1f, 1f)
+        if (rc >= 0) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"connected","message":"Zoom command sent."}""",
+            )
+            return true
+        }
+        dispatchNativeEvent(
+            "state",
+            """{"status":"ready","message":"Zoom command not supported by current camera control path."}""",
         )
         return false
     }

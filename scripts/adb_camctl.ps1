@@ -1,7 +1,7 @@
 param(
     [string]$Device = "",
     [Parameter(Mandatory = $true)]
-    [ValidateSet("init", "list", "connect", "start", "stop", "setpid", "detach", "policy", "manual", "activate", "activate2", "probeptz", "dumpxu", "probexu", "replaylinux")]
+    [ValidateSet("init", "list", "connect", "start", "stop", "setpid", "detach", "policy", "manual", "zoom", "activate", "activate2", "probeptz", "dumpxu", "probexu", "replaylinux")]
     [string]$Cmd,
     [int]$VendorId = 0,
     [int]$ProductId = 0,
@@ -14,6 +14,7 @@ param(
     [float]$KdY = 0.10,
     [float]$Pan = 0.0,
     [float]$Tilt = 0.0,
+    [float]$Zoom = 0.0,
     [int]$DurationMs = 300
 )
 
@@ -45,6 +46,9 @@ switch ($Cmd) {
     }
     "manual" {
         $base += " --ef pan $Pan --ef tilt $Tilt --ei durationMs $DurationMs"
+    }
+    "zoom" {
+        $base += " --ef zoom $Zoom --ei durationMs $DurationMs"
     }
 }
 

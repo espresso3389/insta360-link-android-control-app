@@ -1,5 +1,4 @@
 import "dart:async";
-import "dart:typed_data";
 
 import "package:flutter/services.dart";
 
@@ -114,6 +113,20 @@ class InstaLinkTracker {
       <String, dynamic>{
         "pan": pan,
         "tilt": tilt,
+        "durationMs": durationMs,
+      },
+    );
+    return result ?? false;
+  }
+
+  Future<bool> manualZoom({
+    required double zoom,
+    int durationMs = 300,
+  }) async {
+    final bool? result = await _methodChannel.invokeMethod<bool>(
+      "manualZoom",
+      <String, dynamic>{
+        "zoom": zoom,
         "durationMs": durationMs,
       },
     );

@@ -5,6 +5,8 @@ import "package:flutter/material.dart";
 
 import "insta_link_tracker.dart";
 
+enum _ControlMode { automatic, manual }
+
 class TrackingPage extends StatefulWidget {
   const TrackingPage({super.key});
 
@@ -21,7 +23,7 @@ class _TrackingPageState extends State<TrackingPage> {
   String _status = "idle";
   String _message = "Press Initialize to start.";
   bool _isRunning = false;
-  bool _linkTrackingToGimbal = true;
+  _ControlMode _mode = _ControlMode.automatic;
   int _lastGimbalCmdMs = 0;
 
   double _fps = 0;
@@ -51,6 +53,7 @@ class _TrackingPageState extends State<TrackingPage> {
     _previewTimer = Timer.periodic(const Duration(milliseconds: 220), (_) {
       unawaited(_refreshPreviewFrame());
     });
+    unawaited(_autoBootstrap());
   }
 
   @override
@@ -81,6 +84,9 @@ class _TrackingPageState extends State<TrackingPage> {
         _status = (event["status"] ?? _status).toString();
         _message = (event["message"] ?? _message).toString();
         _isRunning = _status == "running";
+        if (_isRunning) {
+          _mode = _ControlMode.automatic;
+        }
       } else if (type == "telemetry") {
         _fps = _asDouble(event["fps"], _fps);
         _latencyMs = _asDouble(event["latencyMs"], _latencyMs);
@@ -97,6 +103,7 @@ class _TrackingPageState extends State<TrackingPage> {
       }
     });
     if (type == "telemetry" &&
+        _mode == _ControlMode.automatic &&
         !(event["source"] ?? "").toString().startsWith("yolov8n-face-tflite")) {
       unawaited(_maybeSendTrackingGimbal(_pan, _tilt, _fps));
     }
@@ -107,7 +114,7 @@ class _TrackingPageState extends State<TrackingPage> {
     double tilt,
     double fps,
   ) async {
-    if (!_isRunning || !_linkTrackingToGimbal || fps <= 0) {
+    if (!_isRunning || _mode != _ControlMode.automatic || fps <= 0) {
       return;
     }
     final int now = DateTime.now().millisecondsSinceEpoch;
@@ -141,9 +148,12 @@ class _TrackingPageState extends State<TrackingPage> {
     });
   }
 
-  Future<void> _initialize() async {
-    final bool ok = await _tracker.init();
-    if (!ok) {
+  Future<void> _autoBootstrap() async {
+    setState(() {
+      _message = "Auto starting camera + tracking...";
+    });
+    final bool inited = await _tracker.init();
+    if (!inited) {
       setState(() {
         _status = "error";
         _message = "Native init failed.";
@@ -151,20 +161,32 @@ class _TrackingPageState extends State<TrackingPage> {
       return;
     }
     await _refreshDevices();
-    final int uvcCount = _devices
-        .where((Map<String, dynamic> d) => d["isUvc"] == true)
-        .length;
+    final bool connected = await _connectFirstDevice(silent: true);
+    if (!connected) {
+      setState(() {
+        _status = "error";
+        _message = "Auto connect failed. Check USB/hub, then use Reconnect.";
+      });
+      return;
+    }
+    final bool started = await _startTracking(silent: true);
     setState(() {
-      _status = "ready";
-      _message = uvcCount == 0
-          ? "No UVC devices found."
-          : "Found $uvcCount UVC device(s).";
+      _mode = _ControlMode.automatic;
+      _status = started ? "running" : "error";
+      _isRunning = started;
+      _message = started ? "Automatic tracking active." : "Auto start failed.";
     });
   }
 
-  Future<void> _connectFirstDevice() async {
+  Future<bool> _connectFirstDevice({bool silent = false}) async {
     if (_devices.isEmpty) {
-      return;
+      if (!silent) {
+        setState(() {
+          _status = "error";
+          _message = "No USB devices found.";
+        });
+      }
+      return false;
     }
     final Map<String, dynamic>? first = _devices
         .cast<Map<String, dynamic>?>()
@@ -177,22 +199,27 @@ class _TrackingPageState extends State<TrackingPage> {
         _status = "error";
         _message = "No UVC camera device found. Hub/device order changed.";
       });
-      return;
+      return false;
     }
     final bool ok = await _tracker.connectDevice(
       vid: (first["vid"] as num?)?.toInt() ?? 0,
       pid: (first["pid"] as num?)?.toInt() ?? 0,
     );
-    setState(() {
+    if (!silent) {
+      setState(() {
+        _connectedDeviceName = (first["name"] ?? "-").toString();
+        _status = ok ? "connected" : "error";
+        _message = ok
+            ? "Connected to ${first["name"] ?? "device"}."
+            : "Connect failed.";
+      });
+    } else if (ok) {
       _connectedDeviceName = (first["name"] ?? "-").toString();
-      _status = ok ? "connected" : "error";
-      _message = ok
-          ? "Connected to ${first["name"] ?? "device"}."
-          : "Connect failed.";
-    });
+    }
+    return ok;
   }
 
-  Future<void> _startTracking() async {
+  Future<bool> _startTracking({bool silent = false}) async {
     await _tracker.setPid(
       kpX: _kpX,
       kiX: _kiX,
@@ -202,42 +229,63 @@ class _TrackingPageState extends State<TrackingPage> {
       kdY: _kdY,
     );
     final bool ok = await _tracker.startTracking();
-    setState(() {
-      _status = ok ? "running" : "error";
-      _isRunning = ok;
-      _message = ok ? "Tracking started." : "Start failed.";
-    });
+    if (!silent) {
+      setState(() {
+        _status = ok ? "running" : "error";
+        _isRunning = ok;
+        _mode = ok ? _ControlMode.automatic : _mode;
+        _message = ok ? "Automatic tracking active." : "Start failed.";
+      });
+    }
+    return ok;
   }
 
-  Future<void> _reconnectNow() async {
-    final bool ok = await _tracker.reconnect();
-    setState(() {
-      _status = ok ? "connected" : "error";
-      _message = ok ? "Reconnect succeeded." : "Reconnect failed.";
-    });
+  Future<bool> _stopTracking({bool silent = false}) async {
+    final bool ok = await _tracker.stopTracking();
+    if (!silent) {
+      setState(() {
+        _status = ok ? "connected" : "error";
+        _isRunning = false;
+        _message = ok ? "Tracking stopped." : "Stop failed.";
+      });
+    }
+    return ok;
+  }
+
+  Future<void> _setAutomaticMode() async {
+    final bool ok = await _startTracking();
     if (ok) {
-      await _refreshDevices();
+      setState(() {
+        _mode = _ControlMode.automatic;
+      });
     }
   }
 
-  Future<void> _stopTracking() async {
-    final bool ok = await _tracker.stopTracking();
+  Future<void> _enterManualMode() async {
+    if (_isRunning) {
+      await _stopTracking(silent: true);
+    }
     setState(() {
-      _status = ok ? "connected" : "error";
+      _mode = _ControlMode.manual;
       _isRunning = false;
-      _message = ok ? "Tracking stopped." : "Stop failed.";
+      _status = "connected";
+      _message = "Manual mode active. Press Automatic to resume face tracking.";
     });
   }
 
-  Future<void> _activateCamera() async {
-    final bool ok = await _tracker.activateCamera();
+  Future<void> _manualZoom(double zoom) async {
+    await _enterManualMode();
+    final bool ok = await _tracker.manualZoom(zoom: zoom, durationMs: 350);
     setState(() {
-      _status = ok ? "connected" : "error";
-      _message = ok ? "Camera activated." : "Camera activation failed.";
+      _message = ok ? "Manual zoom ${zoom > 0 ? "in" : "out"}" : "Manual zoom failed.";
+      if (!ok) {
+        _status = "error";
+      }
     });
   }
 
   Future<void> _manualMove(double pan, double tilt) async {
+    await _enterManualMode();
     final bool ok = await _tracker.manualControl(
       pan: pan,
       tilt: tilt,
@@ -255,94 +303,106 @@ class _TrackingPageState extends State<TrackingPage> {
 
   @override
   Widget build(BuildContext context) {
-    final ThemeData theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text("Insta360 Link Face Tracker")),
       body: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
-            _StatusCard(status: _status, message: _message),
-            const SizedBox(height: 12),
             Expanded(
               child: Row(
                 children: <Widget>[
                   Expanded(child: _PreviewCard(face: _face, jpegFrame: _previewJpeg)),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: 8),
                   SizedBox(
-                    width: 320,
-                    child: ListView(
+                    width: 340,
+                    child: Column(
                       children: <Widget>[
-                        _ControlsCard(
-                          onInitialize: _initialize,
-                          onRefresh: _refreshDevices,
-                          onReconnect: _reconnectNow,
-                          onConnect: _connectFirstDevice,
-                          onActivateCamera: _activateCamera,
-                          onStart: _startTracking,
-                          onStop: _stopTracking,
-                          hasDevices: _devices.isNotEmpty,
-                          running: _isRunning,
-                        ),
-                        const SizedBox(height: 12),
-                        _GimbalCard(
-                          onMove: _manualMove,
-                          linkTrackingToGimbal: _linkTrackingToGimbal,
-                          onToggleLink: (bool v) {
-                            setState(() {
-                              _linkTrackingToGimbal = v;
-                            });
-                          },
-                        ),
-                        const SizedBox(height: 12),
-                        _TelemetryCard(
-                          fps: _fps,
-                          latencyMs: _latencyMs,
-                          pan: _pan,
-                          tilt: _tilt,
-                        ),
-                        const SizedBox(height: 12),
-                        _UsbHealthCard(
-                          connectedDeviceName: _connectedDeviceName,
-                          totalDevices: _devices.length,
-                          uvcDevices: _devices
-                              .where(
-                                (Map<String, dynamic> d) => d["isUvc"] == true,
-                              )
-                              .length,
-                          streamSource: _streamSource,
-                          streamKbps: _streamKbps,
-                          streamPackets: _streamPackets,
-                          streamFrames: _streamFrames,
-                          streamBytes: _streamBytes,
-                        ),
-                        const SizedBox(height: 12),
-                        _PidCard(
-                          kpX: _kpX,
-                          kiX: _kiX,
-                          kdX: _kdX,
-                          kpY: _kpY,
-                          kiY: _kiY,
-                          kdY: _kdY,
-                          onChanged:
-                              (
-                                double kpX,
-                                double kiX,
-                                double kdX,
-                                double kpY,
-                                double kiY,
-                                double kdY,
-                              ) {
-                                setState(() {
-                                  _kpX = kpX;
-                                  _kiX = kiX;
-                                  _kdX = kdX;
-                                  _kpY = kpY;
-                                  _kiY = kiY;
-                                  _kdY = kdY;
-                                });
-                              },
+                        Expanded(
+                          child: DefaultTabController(
+                            length: 4,
+                            child: Column(
+                              children: <Widget>[
+                                const TabBar(
+                                  isScrollable: true,
+                                  tabs: <Widget>[
+                                    Tab(text: "Gimbal"),
+                                    Tab(text: "Telemetry"),
+                                    Tab(text: "USB"),
+                                    Tab(text: "PID"),
+                                  ],
+                                ),
+                                const SizedBox(height: 4),
+                                Expanded(
+                                  child: TabBarView(
+                                    children: <Widget>[
+                                      SingleChildScrollView(
+                                        child: _GimbalCard(
+                                          onMove: _manualMove,
+                                          onZoom: _manualZoom,
+                                          mode: _mode,
+                                          onAutomatic: _setAutomaticMode,
+                                          onManual: _enterManualMode,
+                                        ),
+                                      ),
+                                      SingleChildScrollView(
+                                        child: _TelemetryCard(
+                                          fps: _fps,
+                                          latencyMs: _latencyMs,
+                                          pan: _pan,
+                                          tilt: _tilt,
+                                        ),
+                                      ),
+                                      SingleChildScrollView(
+                                        child: _UsbHealthCard(
+                                          connectedDeviceName: _connectedDeviceName,
+                                          totalDevices: _devices.length,
+                                          uvcDevices: _devices
+                                              .where(
+                                                (Map<String, dynamic> d) => d["isUvc"] == true,
+                                              )
+                                              .length,
+                                          streamSource: _streamSource,
+                                          streamKbps: _streamKbps,
+                                          streamPackets: _streamPackets,
+                                          streamFrames: _streamFrames,
+                                          streamBytes: _streamBytes,
+                                        ),
+                                      ),
+                                      SingleChildScrollView(
+                                        child: _PidCard(
+                                          kpX: _kpX,
+                                          kiX: _kiX,
+                                          kdX: _kdX,
+                                          kpY: _kpY,
+                                          kiY: _kiY,
+                                          kdY: _kdY,
+                                          onChanged:
+                                              (
+                                                double kpX,
+                                                double kiX,
+                                                double kdX,
+                                                double kpY,
+                                                double kiY,
+                                                double kdY,
+                                              ) {
+                                                setState(() {
+                                                  _kpX = kpX;
+                                                  _kiX = kiX;
+                                                  _kdX = kdX;
+                                                  _kpY = kpY;
+                                                  _kiY = kiY;
+                                                  _kdY = kdY;
+                                                });
+                                              },
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
                       ],
                     ),
@@ -350,34 +410,8 @@ class _TrackingPageState extends State<TrackingPage> {
                 ],
               ),
             ),
-            const SizedBox(height: 8),
-            Text(
-              "Tip: Start Tracking uses libuvc stream + YOLOv8n-face TFLite and drives gimbal via UVC PTZ.",
-              style: theme.textTheme.bodySmall,
-            ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _StatusCard extends StatelessWidget {
-  const _StatusCard({required this.status, required this.message});
-
-  final String status;
-  final String message;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: ListTile(
-        leading: Icon(
-          status == "error" ? Icons.error_outline : Icons.usb_rounded,
-          color: status == "error" ? Colors.red : null,
-        ),
-        title: Text("State: $status"),
-        subtitle: Text(message),
       ),
     );
   }
@@ -452,96 +486,20 @@ class _FacePainter extends CustomPainter {
       oldDelegate.face != face;
 }
 
-class _ControlsCard extends StatelessWidget {
-  const _ControlsCard({
-    required this.onInitialize,
-    required this.onRefresh,
-    required this.onReconnect,
-    required this.onConnect,
-    required this.onActivateCamera,
-    required this.onStart,
-    required this.onStop,
-    required this.hasDevices,
-    required this.running,
-  });
-
-  final Future<void> Function() onInitialize;
-  final Future<void> Function() onRefresh;
-  final Future<void> Function() onReconnect;
-  final Future<void> Function() onConnect;
-  final Future<void> Function() onActivateCamera;
-  final Future<void> Function() onStart;
-  final Future<void> Function() onStop;
-  final bool hasDevices;
-  final bool running;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            const Text(
-              "Controls",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            FilledButton.icon(
-              onPressed: onInitialize,
-              icon: const Icon(Icons.settings_input_hdmi_rounded),
-              label: const Text("Initialize"),
-            ),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: onRefresh,
-              icon: const Icon(Icons.refresh),
-              label: const Text("Refresh USB"),
-            ),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: onReconnect,
-              icon: const Icon(Icons.usb_off),
-              label: const Text("Reconnect Now"),
-            ),
-            const SizedBox(height: 8),
-            OutlinedButton(
-              onPressed: hasDevices ? onConnect : null,
-              child: const Text("Connect First Device"),
-            ),
-            const SizedBox(height: 8),
-            OutlinedButton(
-              onPressed: onActivateCamera,
-              child: const Text("Activate Camera"),
-            ),
-            const SizedBox(height: 8),
-            FilledButton(
-              onPressed: running ? null : onStart,
-              child: const Text("Start Tracking"),
-            ),
-            const SizedBox(height: 8),
-            OutlinedButton(
-              onPressed: running ? onStop : null,
-              child: const Text("Stop Tracking"),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _GimbalCard extends StatelessWidget {
   const _GimbalCard({
     required this.onMove,
-    required this.linkTrackingToGimbal,
-    required this.onToggleLink,
+    required this.onZoom,
+    required this.mode,
+    required this.onAutomatic,
+    required this.onManual,
   });
 
   final Future<void> Function(double pan, double tilt) onMove;
-  final bool linkTrackingToGimbal;
-  final ValueChanged<bool> onToggleLink;
+  final Future<void> Function(double zoom) onZoom;
+  final _ControlMode mode;
+  final Future<void> Function() onAutomatic;
+  final Future<void> Function() onManual;
 
   @override
   Widget build(BuildContext context) {
@@ -551,65 +509,92 @@ class _GimbalCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
-            const Text(
-              "Gimbal Presets",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 4),
-            const Text(
-              "Direction is camera-perspective (camera's left/right), not mirror-selfie perspective.",
-              style: TextStyle(fontSize: 12, color: Colors.black54),
-            ),
-            const SizedBox(height: 8),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text("Link Tracking -> Gimbal"),
-              value: linkTrackingToGimbal,
-              onChanged: onToggleLink,
-            ),
-            const SizedBox(height: 4),
             Row(
               children: <Widget>[
                 Expanded(
+                  child: FilledButton(
+                    onPressed: mode == _ControlMode.automatic ? null : onAutomatic,
+                    child: const Text("Automatic"),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: mode == _ControlMode.manual ? null : onManual,
+                    child: const Text("Manual"),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                const Spacer(),
+                SizedBox(
+                  width: 72,
                   child: OutlinedButton(
                     onPressed: () => onMove(0, 1),
-                    child: const Text("Up"),
+                    child: const Icon(Icons.keyboard_arrow_up),
                   ),
                 ),
+                const Spacer(),
               ],
             ),
             const SizedBox(height: 6),
             Row(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: <Widget>[
-                Expanded(
+                SizedBox(
+                  width: 72,
                   child: OutlinedButton(
                     onPressed: () => onMove(-1, 0),
-                    child: const Text("Left"),
+                    child: const Icon(Icons.keyboard_arrow_left),
                   ),
                 ),
                 const SizedBox(width: 8),
-                Expanded(
+                SizedBox(
+                  width: 72,
                   child: OutlinedButton(
                     onPressed: () => onMove(0, 0),
-                    child: const Text("Center"),
+                    child: const Icon(Icons.gps_fixed),
                   ),
                 ),
                 const SizedBox(width: 8),
-                Expanded(
+                SizedBox(
+                  width: 72,
                   child: OutlinedButton(
                     onPressed: () => onMove(1, 0),
-                    child: const Text("Right"),
+                    child: const Icon(Icons.keyboard_arrow_right),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 6),
             Row(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: <Widget>[
-                Expanded(
+                SizedBox(
+                  width: 72,
+                  child: OutlinedButton(
+                    onPressed: () => onZoom(1),
+                    child: const Icon(Icons.zoom_in),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 72,
                   child: OutlinedButton(
                     onPressed: () => onMove(0, -1),
-                    child: const Text("Down"),
+                    child: const Icon(Icons.keyboard_arrow_down),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 72,
+                  child: OutlinedButton(
+                    onPressed: () => onZoom(-1),
+                    child: const Icon(Icons.zoom_out),
                   ),
                 ),
               ],
@@ -748,37 +733,43 @@ class _PidCard extends StatelessWidget {
             _PidSlider(
               label: "Kp X",
               value: kpX,
-              max: 0.05,
+              min: -2.0,
+              max: 2.0,
               onChanged: (double v) => onChanged(v, kiX, kdX, kpY, kiY, kdY),
             ),
             _PidSlider(
               label: "Ki X",
               value: kiX,
-              max: 0.01,
+              min: -0.5,
+              max: 0.5,
               onChanged: (double v) => onChanged(kpX, v, kdX, kpY, kiY, kdY),
             ),
             _PidSlider(
               label: "Kd X",
               value: kdX,
-              max: 0.02,
+              min: -1.0,
+              max: 1.0,
               onChanged: (double v) => onChanged(kpX, kiX, v, kpY, kiY, kdY),
             ),
             _PidSlider(
               label: "Kp Y",
               value: kpY,
-              max: 0.05,
+              min: -2.0,
+              max: 2.0,
               onChanged: (double v) => onChanged(kpX, kiX, kdX, v, kiY, kdY),
             ),
             _PidSlider(
               label: "Ki Y",
               value: kiY,
-              max: 0.01,
+              min: -0.5,
+              max: 0.5,
               onChanged: (double v) => onChanged(kpX, kiX, kdX, kpY, v, kdY),
             ),
             _PidSlider(
               label: "Kd Y",
               value: kdY,
-              max: 0.02,
+              min: -1.0,
+              max: 1.0,
               onChanged: (double v) => onChanged(kpX, kiX, kdX, kpY, kiY, v),
             ),
           ],
@@ -792,12 +783,14 @@ class _PidSlider extends StatelessWidget {
   const _PidSlider({
     required this.label,
     required this.value,
+    required this.min,
     required this.max,
     required this.onChanged,
   });
 
   final String label;
   final double value;
+  final double min;
   final double max;
   final ValueChanged<double> onChanged;
 
@@ -808,8 +801,8 @@ class _PidSlider extends StatelessWidget {
         SizedBox(width: 42, child: Text(label)),
         Expanded(
           child: Slider(
-            value: value,
-            min: 0,
+            value: value.clamp(min, max),
+            min: min,
             max: max,
             divisions: 100,
             label: value.toStringAsFixed(4),

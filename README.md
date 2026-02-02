@@ -95,6 +95,9 @@ adb shell am start -n com.example.insta360link_android_test/.MainActivity --es c
 # Manual pan/tilt command hook (currently telemetry/state hook)
 adb shell am start -n com.example.insta360link_android_test/.MainActivity --es cmd manual --ef pan 0.2 --ef tilt -0.1 --ei durationMs 400
 
+# Manual zoom command (best-effort UVC relative zoom)
+adb shell am start -n com.example.insta360link_android_test/.MainActivity --es cmd zoom --ef zoom 1.0 --ei durationMs 400
+
 # Replay Linux-captured PTZ baseline packets
 adb shell am start -n com.example.insta360link_android_test/.MainActivity --es cmd replaylinux
 ```
@@ -111,6 +114,7 @@ Use `scripts/adb_camctl.ps1` to run command + fetch logs:
 .\scripts\adb_camctl.ps1 -Cmd setpid -KpX -1.2 -KiX 0 -KdX -0.12 -KpY 1.0 -KiY 0 -KdY 0.10
 .\scripts\adb_camctl.ps1 -Cmd start
 .\scripts\adb_camctl.ps1 -Cmd manual -Pan 0.2 -Tilt -0.1 -DurationMs 400
+.\scripts\adb_camctl.ps1 -Cmd zoom -Zoom 1.0 -DurationMs 400
 .\scripts\adb_camctl.ps1 -Cmd replaylinux
 .\scripts\adb_camctl.ps1 -Cmd stop
 ```
@@ -119,3 +123,10 @@ Use `scripts/adb_camctl.ps1` to run command + fetch logs:
 
 - Left/Right is **camera-perspective** (the camera's own left/right), not mirror/selfie perspective.
 - Example: manual `pan -1` means "move to camera-left".
+
+## App UX behavior
+
+- On app launch, it automatically runs: `init -> connect first UVC device -> start tracking`.
+- Manual pan/tilt/zoom commands switch the app to **Manual** mode (automatic tracking stops).
+- Automatic tracking resumes only when the user presses **Automatic** in the app.
+- Zoom is sent with a best-effort UVC relative zoom command and may vary by camera firmware/control path.
