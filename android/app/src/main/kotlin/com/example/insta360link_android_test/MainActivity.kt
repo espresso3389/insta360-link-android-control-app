@@ -48,14 +48,21 @@ import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
+import org.tensorflow.lite.Interpreter
 
 class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventChannel.StreamHandler {
-    private val tag = "InstaLinkTracker"
+    private val tag = "Insta360LinkTracker"
     private val methodChannelName = "insta_link_tracker/methods"
     private val eventChannelName = "insta_link_tracker/events"
     private val usbPermissionAction = "com.example.insta360link_android_test.USB_PERMISSION"
     private val cameraPermissionRequestCode = 22001
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val embedderModelCandidates =
+        listOf(
+            "models/edgeface_s.tflite",
+            "models/edgeface-s.tflite",
+            "edgeface_s.tflite",
+        )
 
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
@@ -78,6 +85,11 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
+    private var faceEmbedder: Interpreter? = null
+    private var embedderInputWidth = 112
+    private var embedderInputHeight = 112
+    private var embedderInputChannels = 3
+    private var embedderOutputSize = 128
     private var cameraFramesSinceReport = 0L
     private var cameraLastReportMs = 0L
     private var previewWarmupUntilMs = 0L
@@ -268,6 +280,41 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         when (call.method) {
             "init" -> result.success(nativeInit())
             "listDevices" -> result.success(listUsbDevices())
+            "getPid" -> {
+                result.success(
+                    mapOf(
+                        "kpX" to pidKpX,
+                        "kiX" to pidKiX,
+                        "kdX" to pidKdX,
+                        "kpY" to pidKpY,
+                        "kiY" to pidKiY,
+                        "kdY" to pidKdY,
+                    ),
+                )
+            }
+            "extractFaceEmbedding" -> {
+                val args = call.arguments as? Map<*, *>
+                val jpeg = args?.get("jpeg") as? ByteArray
+                if (jpeg == null) {
+                    result.error("invalid_args", "Missing jpeg bytes.", null)
+                    return
+                }
+                thread {
+                    try {
+                        val embedding = runFaceEmbedding(jpeg)
+                        runOnUiThread { result.success(embedding.toList()) }
+                    } catch (t: Throwable) {
+                        Log.e(tag, "extractFaceEmbedding failed", t)
+                        runOnUiThread {
+                            result.error(
+                                "embed_failed",
+                                t.message ?: "Embedding failed",
+                                null,
+                            )
+                        }
+                    }
+                }
+            }
 
             "connectDevice" -> {
                 val args = call.arguments as? Map<*, *>
@@ -352,6 +399,90 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
 
             else -> result.notImplemented()
         }
+    }
+
+    private fun ensureFaceEmbedder(): Interpreter {
+        val existing = faceEmbedder
+        if (existing != null) {
+            return existing
+        }
+        var lastError: Throwable? = null
+        for (candidate in embedderModelCandidates) {
+            try {
+                val model = loadAssetModel(candidate)
+                val interpreter = Interpreter(model)
+                val inputShape = interpreter.getInputTensor(0).shape()
+                val outputShape = interpreter.getOutputTensor(0).shape()
+                if (inputShape.size >= 4) {
+                    val nhwc = inputShape[3] == 3
+                    if (nhwc) {
+                        embedderInputHeight = inputShape[1]
+                        embedderInputWidth = inputShape[2]
+                        embedderInputChannels = inputShape[3]
+                    } else {
+                        embedderInputChannels = inputShape[1]
+                        embedderInputHeight = inputShape[2]
+                        embedderInputWidth = inputShape[3]
+                        Log.w(tag, "Embedder input appears NCHW; using fallback NHWC feed")
+                    }
+                }
+                if (outputShape.isNotEmpty()) {
+                    embedderOutputSize = outputShape.last()
+                }
+                faceEmbedder = interpreter
+                Log.i(tag, "Loaded face embedder model from $candidate")
+                return interpreter
+            } catch (t: Throwable) {
+                lastError = t
+                Log.w(tag, "Failed to load embedder model $candidate", t)
+            }
+        }
+        throw IllegalStateException(
+            "Face embedder model not found. Place mobilefacenet.tflite in android/app/src/main/assets/models/",
+            lastError,
+        )
+    }
+
+    private fun loadAssetModel(path: String): ByteBuffer {
+        assets.open(path).use { stream ->
+            val bytes = stream.readBytes()
+            val buffer = ByteBuffer.allocateDirect(bytes.size)
+            buffer.order(ByteOrder.nativeOrder())
+            buffer.put(bytes)
+            buffer.rewind()
+            return buffer
+        }
+    }
+
+    private fun runFaceEmbedding(jpeg: ByteArray): FloatArray {
+        val interpreter = ensureFaceEmbedder()
+        val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+            ?: throw IllegalArgumentException("Invalid JPEG input")
+        val scaled = Bitmap.createScaledBitmap(
+            bitmap,
+            embedderInputWidth,
+            embedderInputHeight,
+            true,
+        )
+        val input =
+            ByteBuffer
+                .allocateDirect(embedderInputWidth * embedderInputHeight * embedderInputChannels * 4)
+                .order(ByteOrder.nativeOrder())
+        for (y in 0 until embedderInputHeight) {
+            for (x in 0 until embedderInputWidth) {
+                val pixel = scaled.getPixel(x, y)
+                val r = ((pixel shr 16) and 0xFF).toFloat()
+                val g = ((pixel shr 8) and 0xFF).toFloat()
+                val b = (pixel and 0xFF).toFloat()
+                input.putFloat((r - 127.5f) / 128f)
+                input.putFloat((g - 127.5f) / 128f)
+                input.putFloat((b - 127.5f) / 128f)
+            }
+        }
+        input.rewind()
+        val output = Array(1) { FloatArray(embedderOutputSize) }
+        interpreter.run(input, output)
+        return output[0]
     }
 
     private fun getPreviewJpegFrame(ignoreWarmup: Boolean = false): ByteArray? {

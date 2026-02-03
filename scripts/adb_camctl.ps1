@@ -55,4 +55,4 @@ switch ($Cmd) {
 Run-Adb "$adb logcat -c"
 Run-Adb $base
 Start-Sleep -Milliseconds 700
-Run-Adb "$adb logcat -d -s InstaLinkTracker"
+Run-Adb "$adb logcat -d -s Insta360LinkTracker"

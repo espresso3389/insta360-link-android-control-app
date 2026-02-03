@@ -1,9 +1,13 @@
 import "dart:async";
 import "dart:typed_data";
+import "dart:math" as Math;
 
 import "package:flutter/material.dart";
+import "package:image/image.dart" as img;
 
-import "insta_link_tracker.dart";
+import "insta360link_tracker.dart";
+import "data/face_person.dart";
+import "data/isar_service.dart";
 
 enum _ControlMode { automatic, manual }
 
@@ -15,22 +19,34 @@ class TrackingPage extends StatefulWidget {
 }
 
 class _TrackingPageState extends State<TrackingPage> {
-  final InstaLinkTracker _tracker = InstaLinkTracker();
+  final Insta360LinkTracker _tracker = Insta360LinkTracker();
 
-  StreamSubscription<Map<String, dynamic>>? _eventSub;
+  StreamSubscription<Insta360LinkEvent>? _eventSub;
   Timer? _previewTimer;
-  List<Map<String, dynamic>> _devices = <Map<String, dynamic>>[];
+  List<Insta360LinkDeviceInfo> _devices = <Insta360LinkDeviceInfo>[];
   String _status = "idle";
   String _message = "Press Initialize to start.";
   bool _trackingActive = false;
   _ControlMode _mode = _ControlMode.automatic;
   int _lastGimbalCmdMs = 0;
+  IsarService? _isar;
+  List<FacePerson> _people = <FacePerson>[];
+  String _serverUrl = "";
+  final TextEditingController _personNameController = TextEditingController();
+  final TextEditingController _serverUrlController = TextEditingController();
 
   double _fps = 0;
   double _latencyMs = 0;
   double _pan = 0;
   double _tilt = 0;
-  Map<String, dynamic>? _face;
+  Insta360LinkFaceEvent? _face;
+  String? _identityLabel;
+  double? _identityConfidence;
+  bool _identityInFlight = false;
+  int _lastIdentifyMs = 0;
+  int _lastFaceMs = 0;
+  int _faceConsecutive = 0;
+  final double _localMatchThreshold = 0.55;
   double _streamKbps = 0;
   int _streamPackets = 0;
   int _streamFrames = 0;
@@ -54,6 +70,8 @@ class _TrackingPageState extends State<TrackingPage> {
     _previewTimer = Timer.periodic(const Duration(milliseconds: 220), (_) {
       unawaited(_refreshPreviewFrame());
     });
+    unawaited(_initStorage());
+    unawaited(_syncPidFromDevice());
     unawaited(_autoBootstrap());
   }
 
@@ -61,8 +79,25 @@ class _TrackingPageState extends State<TrackingPage> {
   void dispose() {
     _previewTimer?.cancel();
     _eventSub?.cancel();
+    _personNameController.dispose();
+    _serverUrlController.dispose();
     _tracker.dispose();
     super.dispose();
+  }
+
+  Future<void> _initStorage() async {
+    final isar = await IsarService.getInstance();
+    final settings = await isar.getSettings();
+    final people = await isar.listPeople();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isar = isar;
+      _serverUrl = settings.serverUrl;
+      _serverUrlController.text = settings.serverUrl;
+      _people = people;
+    });
   }
 
   Future<void> _refreshPreviewFrame() async {
@@ -75,22 +110,168 @@ class _TrackingPageState extends State<TrackingPage> {
     });
   }
 
-  void _onEvent(Map<String, dynamic> event) {
-    final String type = (event["type"] ?? "").toString();
+  Uint8List? _captureFaceJpeg() {
+    final face = _face;
+    final jpeg = _previewJpeg;
+    if (face == null || jpeg == null || jpeg.isEmpty) {
+      return null;
+    }
+    final decoded = img.decodeImage(jpeg);
+    if (decoded == null) {
+      return null;
+    }
+    final double x = face.x;
+    final double y = face.y;
+    final double w = face.w;
+    final double h = face.h;
+    if (w <= 0 || h <= 0) {
+      return null;
+    }
+    final int imgW = decoded.width;
+    final int imgH = decoded.height;
+    final double pad = 0.2;
+    final int left =
+        ((x - pad * w) * imgW).clamp(0, imgW - 1).toInt();
+    final int top =
+        ((y - pad * h) * imgH).clamp(0, imgH - 1).toInt();
+    final int right =
+        ((x + (1 + pad) * w) * imgW).clamp(1, imgW).toInt();
+    final int bottom =
+        ((y + (1 + pad) * h) * imgH).clamp(1, imgH).toInt();
+    final int cropW = (right - left).clamp(1, imgW);
+    final int cropH = (bottom - top).clamp(1, imgH);
+    final cropped = img.copyCrop(
+      decoded,
+      x: left,
+      y: top,
+      width: cropW,
+      height: cropH,
+    );
+    final List<int> faceJpeg = img.encodeJpg(cropped, quality: 90);
+    return Uint8List.fromList(faceJpeg);
+  }
+
+  Future<void> _maybeIdentifyFace() async {
+    if (_identityInFlight) {
+      return;
+    }
+    if (_faceConsecutive < 10) {
+      return;
+    }
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastIdentifyMs < 3000) {
+      return;
+    }
+    final Uint8List? faceJpeg = _captureFaceJpeg();
+    if (faceJpeg == null) {
+      return;
+    }
+    _identityInFlight = true;
+    _lastIdentifyMs = now;
+    try {
+      final List<double>? embedding =
+          await _tracker.extractFaceEmbedding(jpeg: faceJpeg);
+      if (embedding == null || embedding.isEmpty) {
+        return;
+      }
+      final _IdentityMatch? match = _matchEmbedding(embedding);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        if (match == null || match.score < _localMatchThreshold) {
+          _identityLabel = "Unknown";
+          _identityConfidence = null;
+        } else {
+          _identityLabel = match.name;
+          _identityConfidence = match.score * 100.0;
+        }
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _identityLabel = null;
+          _identityConfidence = null;
+        });
+      }
+    } finally {
+      _identityInFlight = false;
+      _faceConsecutive = 0;
+    }
+  }
+
+  _IdentityMatch? _matchEmbedding(List<double> query) {
+    double bestScore = -1;
+    String? bestName;
+    final List<double> normQuery = _normalizeEmbedding(query);
+    for (final FacePerson person in _people) {
+      final List<double>? embedding = person.faceEmbedding;
+      if (embedding == null || embedding.isEmpty) {
+        continue;
+      }
+      final double score = _cosineSimilarity(
+        normQuery,
+        _normalizeEmbedding(embedding),
+      );
+      if (score > bestScore) {
+        bestScore = score;
+        bestName = person.name;
+      }
+    }
+    if (bestName == null) {
+      return null;
+    }
+    return _IdentityMatch(name: bestName, score: bestScore);
+  }
+
+  List<double> _normalizeEmbedding(List<double> vector) {
+    double sum = 0;
+    for (final double v in vector) {
+      sum += v * v;
+    }
+    final double norm = sum == 0 ? 1 : Math.sqrt(sum);
+    return vector.map((double v) => v / norm).toList(growable: false);
+  }
+
+  double _cosineSimilarity(List<double> a, List<double> b) {
+    final int n = a.length < b.length ? a.length : b.length;
+    double dot = 0;
+    for (int i = 0; i < n; i++) {
+      dot += a[i] * b[i];
+    }
+    return dot;
+  }
+
+  Future<void> _syncPidFromDevice() async {
+    final Insta360LinkPid? pid = await _tracker.getPid();
+    if (!mounted || pid == null) {
+      return;
+    }
+    setState(() {
+      _kpX = pid.kpX;
+      _kiX = pid.kiX;
+      _kdX = pid.kdX;
+      _kpY = pid.kpY;
+      _kiY = pid.kiY;
+      _kdY = pid.kdY;
+    });
+  }
+
+  void _onEvent(Insta360LinkEvent event) {
     if (!mounted) {
       return;
     }
     setState(() {
-      if (type == "state") {
-        _status = (event["status"] ?? _status).toString();
-        _message = (event["message"] ?? _message).toString();
+      if (event is Insta360LinkStateEvent) {
+        _status = event.status;
+        _message = event.message;
         // Keep mode explicit; do not auto-flip manual mode on status events.
-      } else if (type == "telemetry") {
-        _fps = _asDouble(event["fps"], _fps);
-        _latencyMs = _asDouble(event["latencyMs"], _latencyMs);
-        _pan = _asDouble(event["pan"], _pan);
-        _tilt = _asDouble(event["tilt"], _tilt);
-        final bool patrol = (event["patrol"] as bool?) ?? false;
+      } else if (event is Insta360LinkTelemetryEvent) {
+        _fps = event.fps;
+        _latencyMs = event.latencyMs;
+        _pan = event.pan;
+        _tilt = event.tilt;
+        final bool patrol = event.patrol;
         if (_mode == _ControlMode.manual) {
           _modeOverlay = "Manual";
         } else if (patrol) {
@@ -98,20 +279,29 @@ class _TrackingPageState extends State<TrackingPage> {
         } else {
           _modeOverlay = "Tracking";
         }
-      } else if (type == "face") {
+      } else if (event is Insta360LinkFaceEvent) {
         _face = event;
-      } else if (type == "stream") {
-        _streamKbps = _asDouble(event["kbps"], _streamKbps);
-        _streamPackets = (event["packets"] as num?)?.toInt() ?? _streamPackets;
-        _streamFrames = (event["frames"] as num?)?.toInt() ?? _streamFrames;
-        _streamBytes = (event["bytes"] as num?)?.toInt() ?? _streamBytes;
-        _streamSource = (event["source"] ?? _streamSource).toString();
+        final int now = DateTime.now().millisecondsSinceEpoch;
+        if (now - _lastFaceMs > 600) {
+          _faceConsecutive = 0;
+        }
+        _lastFaceMs = now;
+        _faceConsecutive += 1;
+      } else if (event is Insta360LinkStreamEvent) {
+        _streamKbps = event.kbps;
+        _streamPackets = event.packets;
+        _streamFrames = event.frames;
+        _streamBytes = event.bytes;
+        _streamSource = event.source;
       }
     });
-    if (type == "telemetry" &&
+    if (event is Insta360LinkFaceEvent) {
+      unawaited(_maybeIdentifyFace());
+    }
+    if (event is Insta360LinkTelemetryEvent &&
         _mode == _ControlMode.automatic &&
-        !(event["source"] ?? "").toString().startsWith("yolov8n-face-tflite")) {
-      unawaited(_maybeSendTrackingGimbal(_pan, _tilt, _fps));
+        !event.source.startsWith("yolov8n-face-tflite")) {
+      unawaited(_maybeSendTrackingGimbal(event.pan, event.tilt, event.fps));
     }
   }
 
@@ -133,22 +323,11 @@ class _TrackingPageState extends State<TrackingPage> {
       return;
     }
     _lastGimbalCmdMs = now;
-    await _tracker.manualControl(
-      pan: panCmd,
-      tilt: tiltCmd,
-      durationMs: 200,
-    );
-  }
-
-  double _asDouble(dynamic value, double fallback) {
-    if (value is num) {
-      return value.toDouble();
-    }
-    return fallback;
+    await _tracker.manualControl(pan: panCmd, tilt: tiltCmd, durationMs: 200);
   }
 
   Future<void> _refreshDevices() async {
-    final List<Map<String, dynamic>> devices = await _tracker.listDevices();
+    final List<Insta360LinkDeviceInfo> devices = await _tracker.listDevices();
     setState(() {
       _devices = devices;
     });
@@ -166,6 +345,7 @@ class _TrackingPageState extends State<TrackingPage> {
       });
       return;
     }
+    await _syncPidFromDevice();
     await _refreshDevices();
     bool connected = false;
     bool started = false;
@@ -195,7 +375,9 @@ class _TrackingPageState extends State<TrackingPage> {
       _status = started ? "running" : "connected";
       _trackingActive = started;
       _modeOverlay = started ? "Tracking" : "Auto";
-      _message = started ? "Automatic tracking active." : "Connected. Tap Automatic to start tracking.";
+      _message = started
+          ? "Automatic tracking active."
+          : "Connected. Tap Automatic to start tracking.";
     });
   }
 
@@ -209,10 +391,10 @@ class _TrackingPageState extends State<TrackingPage> {
       }
       return false;
     }
-    final Map<String, dynamic>? first = _devices
-        .cast<Map<String, dynamic>?>()
+    final Insta360LinkDeviceInfo? first = _devices
+        .cast<Insta360LinkDeviceInfo?>()
         .firstWhere(
-          (Map<String, dynamic>? d) => (d?["isUvc"] == true),
+          (Insta360LinkDeviceInfo? d) => d?.isUvc == true,
           orElse: () => null,
         );
     if (first == null) {
@@ -223,19 +405,17 @@ class _TrackingPageState extends State<TrackingPage> {
       return false;
     }
     final bool ok = await _tracker.connectDevice(
-      vid: (first["vid"] as num?)?.toInt() ?? 0,
-      pid: (first["pid"] as num?)?.toInt() ?? 0,
+      vid: first.vid,
+      pid: first.pid,
     );
     if (!silent) {
       setState(() {
-        _connectedDeviceName = (first["name"] ?? "-").toString();
+        _connectedDeviceName = first.name;
         _status = ok ? "connected" : "error";
-        _message = ok
-            ? "Connected to ${first["name"] ?? "device"}."
-            : "Connect failed.";
+        _message = ok ? "Connected to ${first.name}." : "Connect failed.";
       });
     } else if (ok) {
-      _connectedDeviceName = (first["name"] ?? "-").toString();
+      _connectedDeviceName = first.name;
     }
     return ok;
   }
@@ -288,7 +468,9 @@ class _TrackingPageState extends State<TrackingPage> {
     await _enterManualMode();
     final bool ok = await _tracker.manualZoom(zoom: zoom, durationMs: 350);
     setState(() {
-      _message = ok ? "Manual zoom ${zoom > 0 ? "in" : "out"}" : "Manual zoom failed.";
+      _message = ok
+          ? "Manual zoom ${zoom > 0 ? "in" : "out"}"
+          : "Manual zoom failed.";
       if (!ok) {
         _status = "error";
       }
@@ -315,7 +497,9 @@ class _TrackingPageState extends State<TrackingPage> {
   Future<void> _dumpPreview() async {
     final bool ok = await _tracker.dumpPreview();
     setState(() {
-      _message = ok ? "Preview dumped to /sdcard/Download/preview.jpg" : "Preview dump failed.";
+      _message = ok
+          ? "Preview dumped to /sdcard/Download/preview.jpg"
+          : "Preview dump failed.";
       if (!ok) {
         _status = "error";
       }
@@ -325,11 +509,95 @@ class _TrackingPageState extends State<TrackingPage> {
   Future<void> _recoverPreview() async {
     final bool ok = await _tracker.recoverPreview();
     setState(() {
-      _message = ok ? "Recovery sequence started." : "Recovery sequence failed.";
+      _message = ok
+          ? "Recovery sequence started."
+          : "Recovery sequence failed.";
       if (!ok) {
         _status = "error";
       }
     });
+  }
+
+  Future<void> _saveServerUrl(String url) async {
+    final isar = _isar;
+    if (isar == null) {
+      return;
+    }
+    await isar.updateServerUrl(url);
+    setState(() {
+      _serverUrl = url;
+      _serverUrlController.text = url;
+      _message = "Server URL saved.";
+    });
+  }
+
+  Future<void> _refreshPeople() async {
+    final isar = _isar;
+    if (isar == null) {
+      return;
+    }
+    final people = await isar.listPeople();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _people = people;
+    });
+  }
+
+  Future<void> _openPersonGroup(_PersonGroup group) async {
+    final isar = _isar;
+    if (isar == null || !mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) => _PersonDetailPage(
+          isar: isar,
+          initialName: group.name,
+          initialFaces: group.faces,
+        ),
+      ),
+    );
+    await _refreshPeople();
+  }
+
+  Future<void> _enrollCurrentFace(String name) async {
+    final isar = _isar;
+    if (isar == null) {
+      return;
+    }
+    final Uint8List? faceJpeg = _captureFaceJpeg();
+    if (faceJpeg == null) {
+      setState(() {
+        _message = "No face/preview to enroll.";
+      });
+      return;
+    }
+    final List<double>? embedding =
+        await _tracker.extractFaceEmbedding(jpeg: faceJpeg);
+    if (embedding == null || embedding.isEmpty) {
+      setState(() {
+        _message = "Failed to extract face embedding.";
+      });
+      return;
+    }
+    final face = _face;
+    final person = FacePerson()
+      ..name = name.trim()
+      ..faceJpegBytes = Uint8List.fromList(faceJpeg)
+      ..faceEmbedding = embedding
+      ..boxX = face?.x
+      ..boxY = face?.y
+      ..boxW = face?.w
+      ..boxH = face?.h;
+    await isar.upsertPerson(person);
+    await _refreshPeople();
+    if (mounted) {
+      setState(() {
+        _message = "Enrolled ${person.name}.";
+      });
+    }
   }
 
   @override
@@ -341,222 +609,267 @@ class _TrackingPageState extends State<TrackingPage> {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           child: isPortrait
-            ? Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: <Widget>[
-                  LayoutBuilder(
-                    builder: (BuildContext context, BoxConstraints constraints) {
-                      final double w = constraints.maxWidth;
-                      final double h = w * 9 / 16;
-                      return SizedBox(
+              ? Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    LayoutBuilder(
+                      builder:
+                          (BuildContext context, BoxConstraints constraints) {
+                            final double w = constraints.maxWidth;
+                            final double h = w * 9 / 16;
+                            return SizedBox(
                         height: h,
                         child: _PreviewCard(
                           face: _face,
                           jpegFrame: _previewJpeg,
                           modeOverlay: _modeOverlay,
+                          identityLabel: _identityLabel,
+                          identityConfidence: _identityConfidence,
                         ),
                       );
                     },
                   ),
-                  const SizedBox(height: 8),
-                  Expanded(
-                    flex: 4,
-                    child: _TabPanel(
-                      mode: _mode,
-                      fps: _fps,
-                      latencyMs: _latencyMs,
-                      pan: _pan,
-                      tilt: _tilt,
-                      connectedDeviceName: _connectedDeviceName,
-                      devices: _devices,
-                      streamSource: _streamSource,
-                      streamKbps: _streamKbps,
-                      streamPackets: _streamPackets,
-                      streamFrames: _streamFrames,
-                      streamBytes: _streamBytes,
-                      kpX: _kpX,
-                      kiX: _kiX,
-                      kdX: _kdX,
-                      kpY: _kpY,
-                      kiY: _kiY,
-                      kdY: _kdY,
-                      status: _status,
-                      message: _message,
-                      onMove: _manualMove,
-                      onZoom: _manualZoom,
-                      onAutomatic: _setAutomaticMode,
-                      onManual: _enterManualMode,
-                      onDumpPreview: _dumpPreview,
-                      onRecoverPreview: _recoverPreview,
-                      onPidChanged:
-                          (
-                            double kpX,
-                            double kiX,
-                            double kdX,
-                            double kpY,
-                            double kiY,
-                            double kdY,
-                          ) {
-                            setState(() {
-                              _kpX = kpX;
-                              _kiX = kiX;
-                              _kdX = kdX;
-                              _kpY = kpY;
-                              _kiY = kiY;
-                              _kdY = kdY;
-                            });
-                          },
-                      onInit: () async {
-                        final bool ok = await _tracker.init();
-                        setState(() {
-                          _status = ok ? "ready" : "error";
-                          _message = ok ? "Native init done." : "Native init failed.";
-                        });
-                        await _refreshDevices();
-                      },
-                      onRefresh: _refreshDevices,
-                      onReconnect: () async {
-                        final bool ok = await _tracker.reconnect();
-                        setState(() {
-                          _status = ok ? "connected" : "error";
-                          _message = ok ? "Reconnect done." : "Reconnect failed.";
-                        });
-                      },
-                      onConnectFirst: () async {
-                        final bool ok = await _connectFirstDevice(silent: false);
-                        if (ok) {
+                    const SizedBox(height: 8),
+                    Expanded(
+                      flex: 4,
+                      child: _TabPanel(
+                        mode: _mode,
+                        fps: _fps,
+                        latencyMs: _latencyMs,
+                        pan: _pan,
+                        tilt: _tilt,
+                        connectedDeviceName: _connectedDeviceName,
+                        devices: _devices,
+                        streamSource: _streamSource,
+                        streamKbps: _streamKbps,
+                        streamPackets: _streamPackets,
+                        streamFrames: _streamFrames,
+                        streamBytes: _streamBytes,
+                        kpX: _kpX,
+                        kiX: _kiX,
+                        kdX: _kdX,
+                        kpY: _kpY,
+                        kiY: _kiY,
+                        kdY: _kdY,
+                        status: _status,
+                        message: _message,
+                        onMove: _manualMove,
+                        onZoom: _manualZoom,
+                        onAutomatic: _setAutomaticMode,
+                        onManual: _enterManualMode,
+                        onDumpPreview: _dumpPreview,
+                        onRecoverPreview: _recoverPreview,
+                        people: _people,
+                        onOpenPerson: _openPersonGroup,
+                        onEnroll: (String name) => _enrollCurrentFace(name),
+                        nameController: _personNameController,
+                        serverUrl: _serverUrl,
+                        urlController: _serverUrlController,
+                        onSaveServerUrl: _saveServerUrl,
+                        onPidChanged:
+                            (
+                              double kpX,
+                              double kiX,
+                              double kdX,
+                              double kpY,
+                              double kiY,
+                              double kdY,
+                            ) {
+                              setState(() {
+                                _kpX = kpX;
+                                _kiX = kiX;
+                                _kdX = kdX;
+                                _kpY = kpY;
+                                _kiY = kiY;
+                                _kdY = kdY;
+                              });
+                            },
+                        onInit: () async {
+                          final bool ok = await _tracker.init();
                           setState(() {
-                            _status = "connected";
-                            _message = "Connected to UVC device.";
+                            _status = ok ? "ready" : "error";
+                            _message = ok
+                                ? "Native init done."
+                                : "Native init failed.";
                           });
-                        }
-                      },
-                      onActivateCamera: () async {
-                        final bool ok = await _tracker.activateCamera();
-                        setState(() {
-                          _status = ok ? "connected" : "error";
-                          _message = ok ? "Camera stream active." : "Camera activate failed.";
-                        });
-                      },
-                      onStartTracking: () async {
-                        await _setAutomaticMode();
-                      },
-                      onStopTracking: () async {
-                        final bool ok = await _tracker.stopTracking();
-                        setState(() {
-                          _trackingActive = false;
-                          _status = ok ? "connected" : "error";
-                          _message = ok ? "Tracking stopped." : "Stop failed.";
-                        });
-                      },
+                          if (ok) {
+                            await _syncPidFromDevice();
+                          }
+                          await _refreshDevices();
+                        },
+                        onRefresh: _refreshDevices,
+                        onReconnect: () async {
+                          final bool ok = await _tracker.reconnect();
+                          setState(() {
+                            _status = ok ? "connected" : "error";
+                            _message = ok
+                                ? "Reconnect done."
+                                : "Reconnect failed.";
+                          });
+                        },
+                        onConnectFirst: () async {
+                          final bool ok = await _connectFirstDevice(
+                            silent: false,
+                          );
+                          if (ok) {
+                            setState(() {
+                              _status = "connected";
+                              _message = "Connected to UVC device.";
+                            });
+                          }
+                        },
+                        onActivateCamera: () async {
+                          final bool ok = await _tracker.activateCamera();
+                          setState(() {
+                            _status = ok ? "connected" : "error";
+                            _message = ok
+                                ? "Camera stream active."
+                                : "Camera activate failed.";
+                          });
+                        },
+                        onStartTracking: () async {
+                          await _setAutomaticMode();
+                        },
+                        onStopTracking: () async {
+                          final bool ok = await _tracker.stopTracking();
+                          setState(() {
+                            _trackingActive = false;
+                            _status = ok ? "connected" : "error";
+                            _message = ok
+                                ? "Tracking stopped."
+                                : "Stop failed.";
+                          });
+                        },
+                      ),
                     ),
-                  ),
-                ],
-              )
-            : Row(
-                children: <Widget>[
-                  Expanded(
+                  ],
+                )
+              : Row(
+                  children: <Widget>[
+                    Expanded(
                     child: _PreviewCard(
                       face: _face,
                       jpegFrame: _previewJpeg,
                       modeOverlay: _modeOverlay,
+                      identityLabel: _identityLabel,
+                      identityConfidence: _identityConfidence,
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  SizedBox(
-                    width: 340,
-                    child: _TabPanel(
-                      mode: _mode,
-                      fps: _fps,
-                      latencyMs: _latencyMs,
-                      pan: _pan,
-                      tilt: _tilt,
-                      connectedDeviceName: _connectedDeviceName,
-                      devices: _devices,
-                      streamSource: _streamSource,
-                      streamKbps: _streamKbps,
-                      streamPackets: _streamPackets,
-                      streamFrames: _streamFrames,
-                      streamBytes: _streamBytes,
-                      kpX: _kpX,
-                      kiX: _kiX,
-                      kdX: _kdX,
-                      kpY: _kpY,
-                      kiY: _kiY,
-                      kdY: _kdY,
-                      status: _status,
-                      message: _message,
-                      onMove: _manualMove,
-                      onZoom: _manualZoom,
-                      onAutomatic: _setAutomaticMode,
-                      onManual: _enterManualMode,
-                      onDumpPreview: _dumpPreview,
-                      onRecoverPreview: _recoverPreview,
-                      onPidChanged:
-                          (
-                            double kpX,
-                            double kiX,
-                            double kdX,
-                            double kpY,
-                            double kiY,
-                            double kdY,
-                          ) {
-                            setState(() {
-                              _kpX = kpX;
-                              _kiX = kiX;
-                              _kdX = kdX;
-                              _kpY = kpY;
-                              _kiY = kiY;
-                              _kdY = kdY;
-                            });
-                          },
-                      onInit: () async {
-                        final bool ok = await _tracker.init();
-                        setState(() {
-                          _status = ok ? "ready" : "error";
-                          _message = ok ? "Native init done." : "Native init failed.";
-                        });
-                        await _refreshDevices();
-                      },
-                      onRefresh: _refreshDevices,
-                      onReconnect: () async {
-                        final bool ok = await _tracker.reconnect();
-                        setState(() {
-                          _status = ok ? "connected" : "error";
-                          _message = ok ? "Reconnect done." : "Reconnect failed.";
-                        });
-                      },
-                      onConnectFirst: () async {
-                        final bool ok = await _connectFirstDevice(silent: false);
-                        if (ok) {
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 340,
+                      child: _TabPanel(
+                        mode: _mode,
+                        fps: _fps,
+                        latencyMs: _latencyMs,
+                        pan: _pan,
+                        tilt: _tilt,
+                        connectedDeviceName: _connectedDeviceName,
+                        devices: _devices,
+                        streamSource: _streamSource,
+                        streamKbps: _streamKbps,
+                        streamPackets: _streamPackets,
+                        streamFrames: _streamFrames,
+                        streamBytes: _streamBytes,
+                        kpX: _kpX,
+                        kiX: _kiX,
+                        kdX: _kdX,
+                        kpY: _kpY,
+                        kiY: _kiY,
+                        kdY: _kdY,
+                        status: _status,
+                        message: _message,
+                        onMove: _manualMove,
+                        onZoom: _manualZoom,
+                        onAutomatic: _setAutomaticMode,
+                        onManual: _enterManualMode,
+                        onDumpPreview: _dumpPreview,
+                        onRecoverPreview: _recoverPreview,
+                        people: _people,
+                        onOpenPerson: _openPersonGroup,
+                        onEnroll: (String name) => _enrollCurrentFace(name),
+                        nameController: _personNameController,
+                        serverUrl: _serverUrl,
+                        urlController: _serverUrlController,
+                        onSaveServerUrl: _saveServerUrl,
+                        onPidChanged:
+                            (
+                              double kpX,
+                              double kiX,
+                              double kdX,
+                              double kpY,
+                              double kiY,
+                              double kdY,
+                            ) {
+                              setState(() {
+                                _kpX = kpX;
+                                _kiX = kiX;
+                                _kdX = kdX;
+                                _kpY = kpY;
+                                _kiY = kiY;
+                                _kdY = kdY;
+                              });
+                            },
+                        onInit: () async {
+                          final bool ok = await _tracker.init();
                           setState(() {
-                            _status = "connected";
-                            _message = "Connected to UVC device.";
+                            _status = ok ? "ready" : "error";
+                            _message = ok
+                                ? "Native init done."
+                                : "Native init failed.";
                           });
-                        }
-                      },
-                      onActivateCamera: () async {
-                        final bool ok = await _tracker.activateCamera();
-                        setState(() {
-                          _status = ok ? "connected" : "error";
-                          _message = ok ? "Camera stream active." : "Camera activate failed.";
-                        });
-                      },
-                      onStartTracking: () async {
-                        await _setAutomaticMode();
-                      },
-                      onStopTracking: () async {
-                        final bool ok = await _tracker.stopTracking();
-                        setState(() {
-                          _trackingActive = false;
-                          _status = ok ? "connected" : "error";
-                          _message = ok ? "Tracking stopped." : "Stop failed.";
-                        });
-                      },
+                          if (ok) {
+                            await _syncPidFromDevice();
+                          }
+                          await _refreshDevices();
+                        },
+                        onRefresh: _refreshDevices,
+                        onReconnect: () async {
+                          final bool ok = await _tracker.reconnect();
+                          setState(() {
+                            _status = ok ? "connected" : "error";
+                            _message = ok
+                                ? "Reconnect done."
+                                : "Reconnect failed.";
+                          });
+                        },
+                        onConnectFirst: () async {
+                          final bool ok = await _connectFirstDevice(
+                            silent: false,
+                          );
+                          if (ok) {
+                            setState(() {
+                              _status = "connected";
+                              _message = "Connected to UVC device.";
+                            });
+                          }
+                        },
+                        onActivateCamera: () async {
+                          final bool ok = await _tracker.activateCamera();
+                          setState(() {
+                            _status = ok ? "connected" : "error";
+                            _message = ok
+                                ? "Camera stream active."
+                                : "Camera activate failed.";
+                          });
+                        },
+                        onStartTracking: () async {
+                          await _setAutomaticMode();
+                        },
+                        onStopTracking: () async {
+                          final bool ok = await _tracker.stopTracking();
+                          setState(() {
+                            _trackingActive = false;
+                            _status = ok ? "connected" : "error";
+                            _message = ok
+                                ? "Tracking stopped."
+                                : "Stop failed.";
+                          });
+                        },
+                      ),
                     ),
-                  ),
-                ],
-              ),
+                  ],
+                ),
         ),
       ),
     );
@@ -599,6 +912,13 @@ class _TabPanel extends StatelessWidget {
     required this.onActivateCamera,
     required this.onStartTracking,
     required this.onStopTracking,
+    required this.people,
+    required this.onOpenPerson,
+    required this.onEnroll,
+    required this.nameController,
+    required this.serverUrl,
+    required this.urlController,
+    required this.onSaveServerUrl,
   });
 
   final _ControlMode mode;
@@ -607,7 +927,7 @@ class _TabPanel extends StatelessWidget {
   final double pan;
   final double tilt;
   final String connectedDeviceName;
-  final List<Map<String, dynamic>> devices;
+  final List<Insta360LinkDeviceInfo> devices;
   final String streamSource;
   final double streamKbps;
   final int streamPackets;
@@ -643,19 +963,27 @@ class _TabPanel extends StatelessWidget {
   final Future<void> Function() onActivateCamera;
   final Future<void> Function() onStartTracking;
   final Future<void> Function() onStopTracking;
+  final List<FacePerson> people;
+  final void Function(_PersonGroup group) onOpenPerson;
+  final Future<void> Function(String name) onEnroll;
+  final TextEditingController nameController;
+  final String serverUrl;
+  final TextEditingController urlController;
+  final Future<void> Function(String url) onSaveServerUrl;
 
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 4,
+      length: 5,
       child: Column(
         children: <Widget>[
           const TabBar(
             isScrollable: true,
             tabs: <Widget>[
               Tab(text: "Gimbal"),
+              Tab(text: "People"),
               Tab(text: "Status"),
-              Tab(text: "PID"),
+              Tab(text: "Settings"),
               Tab(text: "Init"),
             ],
           ),
@@ -670,7 +998,14 @@ class _TabPanel extends StatelessWidget {
                     mode: mode,
                     onAutomatic: onAutomatic,
                     onManual: onManual,
-                    onRecoverPreview: onRecoverPreview,
+                  ),
+                ),
+                SingleChildScrollView(
+                  child: _PeopleTab(
+                    people: people,
+                    onOpenPerson: onOpenPerson,
+                    onEnroll: onEnroll,
+                    nameController: nameController,
                   ),
                 ),
                 SingleChildScrollView(
@@ -681,7 +1016,9 @@ class _TabPanel extends StatelessWidget {
                     tilt: tilt,
                     connectedDeviceName: connectedDeviceName,
                     totalDevices: devices.length,
-                    uvcDevices: devices.where((Map<String, dynamic> d) => d["isUvc"] == true).length,
+                    uvcDevices: devices
+                        .where((Insta360LinkDeviceInfo d) => d.isUvc)
+                        .length,
                     streamSource: streamSource,
                     streamKbps: streamKbps,
                     streamPackets: streamPackets,
@@ -692,14 +1029,17 @@ class _TabPanel extends StatelessWidget {
                   ),
                 ),
                 SingleChildScrollView(
-                  child: _PidCard(
+                  child: _SettingsTab(
                     kpX: kpX,
                     kiX: kiX,
                     kdX: kdX,
                     kpY: kpY,
                     kiY: kiY,
                     kdY: kdY,
-                    onChanged: onPidChanged,
+                    onPidChanged: onPidChanged,
+                    serverUrl: serverUrl,
+                    urlController: urlController,
+                    onSaveServerUrl: onSaveServerUrl,
                   ),
                 ),
                 SingleChildScrollView(
@@ -731,11 +1071,15 @@ class _PreviewCard extends StatelessWidget {
     required this.face,
     required this.jpegFrame,
     required this.modeOverlay,
+    required this.identityLabel,
+    required this.identityConfidence,
   });
 
-  final Map<String, dynamic>? face;
+  final Insta360LinkFaceEvent? face;
   final Uint8List? jpegFrame;
   final String modeOverlay;
+  final String? identityLabel;
+  final double? identityConfidence;
 
   @override
   Widget build(BuildContext context) {
@@ -745,11 +1089,7 @@ class _PreviewCard extends StatelessWidget {
         fit: StackFit.expand,
         children: <Widget>[
           if (jpegFrame != null)
-            Image.memory(
-              jpegFrame!,
-              fit: BoxFit.cover,
-              gaplessPlayback: true,
-            )
+            Image.memory(jpegFrame!, fit: BoxFit.cover, gaplessPlayback: true)
           else
             const Center(
               child: Text(
@@ -757,7 +1097,13 @@ class _PreviewCard extends StatelessWidget {
                 style: TextStyle(color: Colors.white70),
               ),
             ),
-          CustomPaint(painter: _FacePainter(face: face)),
+          CustomPaint(
+            painter: _FacePainter(
+              face: face,
+              identityLabel: identityLabel,
+              identityConfidence: identityConfidence,
+            ),
+          ),
           Positioned(
             left: 12,
             top: 10,
@@ -785,19 +1131,25 @@ class _PreviewCard extends StatelessWidget {
 }
 
 class _FacePainter extends CustomPainter {
-  _FacePainter({required this.face});
+  _FacePainter({
+    required this.face,
+    required this.identityLabel,
+    required this.identityConfidence,
+  });
 
-  final Map<String, dynamic>? face;
+  final Insta360LinkFaceEvent? face;
+  final String? identityLabel;
+  final double? identityConfidence;
 
   @override
   void paint(Canvas canvas, Size size) {
     if (face == null) {
       return;
     }
-    final double x = (face!["x"] as num?)?.toDouble() ?? 0.4;
-    final double y = (face!["y"] as num?)?.toDouble() ?? 0.3;
-    final double w = (face!["w"] as num?)?.toDouble() ?? 0.2;
-    final double h = (face!["h"] as num?)?.toDouble() ?? 0.25;
+    final double x = face!.x;
+    final double y = face!.y;
+    final double w = face!.w;
+    final double h = face!.h;
     final Rect rect = Rect.fromLTWH(
       x * size.width,
       y * size.height,
@@ -809,11 +1161,50 @@ class _FacePainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3;
     canvas.drawRect(rect, paint);
+    final String? label = identityLabel;
+    if (label == null || label.isEmpty) {
+      return;
+    }
+    final String confidenceText = identityConfidence == null
+        ? ""
+        : " ${(identityConfidence!).toStringAsFixed(1)}%";
+    final TextSpan span = TextSpan(
+      text: "$label$confidenceText",
+      style: const TextStyle(
+        color: Colors.white,
+        fontSize: 12,
+        fontWeight: FontWeight.w600,
+      ),
+    );
+    final TextPainter textPainter = TextPainter(
+      text: span,
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final double pad = 6;
+    final double boxWidth = textPainter.width + pad * 2;
+    final double boxHeight = textPainter.height + pad * 2;
+    final Offset labelOffset = Offset(
+      rect.left,
+      (rect.top - boxHeight - 6).clamp(0.0, size.height - boxHeight),
+    );
+    final RRect bg = RRect.fromRectAndRadius(
+      Rect.fromLTWH(labelOffset.dx, labelOffset.dy, boxWidth, boxHeight),
+      const Radius.circular(6),
+    );
+    final Paint bgPaint = Paint()
+      ..color = Colors.black.withValues(alpha: 0.6);
+    canvas.drawRRect(bg, bgPaint);
+    textPainter.paint(
+      canvas,
+      Offset(labelOffset.dx + pad, labelOffset.dy + pad),
+    );
   }
 
   @override
   bool shouldRepaint(covariant _FacePainter oldDelegate) =>
-      oldDelegate.face != face;
+      oldDelegate.face != face ||
+      oldDelegate.identityLabel != identityLabel ||
+      oldDelegate.identityConfidence != identityConfidence;
 }
 
 class _GimbalCard extends StatelessWidget {
@@ -823,7 +1214,6 @@ class _GimbalCard extends StatelessWidget {
     required this.mode,
     required this.onAutomatic,
     required this.onManual,
-    required this.onRecoverPreview,
   });
 
   final Future<void> Function(double pan, double tilt) onMove;
@@ -831,7 +1221,6 @@ class _GimbalCard extends StatelessWidget {
   final _ControlMode mode;
   final Future<void> Function() onAutomatic;
   final Future<void> Function() onManual;
-  final Future<void> Function() onRecoverPreview;
 
   @override
   Widget build(BuildContext context) {
@@ -845,7 +1234,9 @@ class _GimbalCard extends StatelessWidget {
               children: <Widget>[
                 Expanded(
                   child: FilledButton(
-                    onPressed: mode == _ControlMode.automatic ? null : onAutomatic,
+                    onPressed: mode == _ControlMode.automatic
+                        ? null
+                        : onAutomatic,
                     child: const Text("Automatic"),
                   ),
                 ),
@@ -859,12 +1250,6 @@ class _GimbalCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 6),
-            OutlinedButton.icon(
-              onPressed: onRecoverPreview,
-              icon: const Icon(Icons.refresh),
-              label: const Text("Try Recovery"),
-            ),
-            const SizedBox(height: 4),
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: <Widget>[
@@ -985,10 +1370,7 @@ class _StatusCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
-            const Text(
-              "Status",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
+            const Text("Status", style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 6),
             const Text(
               "Telemetry",
@@ -1000,10 +1382,7 @@ class _StatusCard extends StatelessWidget {
             Text("Pan: ${pan.toStringAsFixed(2)}"),
             Text("Tilt: ${tilt.toStringAsFixed(2)}"),
             const SizedBox(height: 10),
-            const Text(
-              "USB",
-              style: TextStyle(fontWeight: FontWeight.w600),
-            ),
+            const Text("USB", style: TextStyle(fontWeight: FontWeight.w600)),
             const SizedBox(height: 4),
             Text("Connected: $connectedDeviceName"),
             Text("USB devices: $totalDevices (UVC: $uvcDevices)"),
@@ -1136,7 +1515,7 @@ class _InitCard extends StatelessWidget {
 
   final String status;
   final String message;
-  final List<Map<String, dynamic>> devices;
+  final List<Insta360LinkDeviceInfo> devices;
   final Future<void> Function() onInit;
   final Future<void> Function() onRefresh;
   final Future<void> Function() onReconnect;
@@ -1207,12 +1586,12 @@ class _InitCard extends StatelessWidget {
             if (devices.isEmpty)
               const Text("No devices listed.")
             else
-              ...devices.map((Map<String, dynamic> d) {
-                final String name = (d["name"] ?? "device").toString();
-                final int vid = (d["vid"] as num?)?.toInt() ?? 0;
-                final int pid = (d["pid"] as num?)?.toInt() ?? 0;
-                final bool uvc = d["isUvc"] == true;
-                final bool perm = d["hasPermission"] == true;
+              ...devices.map((Insta360LinkDeviceInfo d) {
+                final String name = d.name;
+                final int vid = d.vid;
+                final int pid = d.pid;
+                final bool uvc = d.isUvc;
+                final bool perm = d.hasPermission;
                 return Text(
                   "$name vid=0x${vid.toRadixString(16)} pid=0x${pid.toRadixString(16)} "
                   "uvc=$uvc perm=$perm",
@@ -1220,6 +1599,480 @@ class _InitCard extends StatelessWidget {
               }),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _PersonGroup {
+  const _PersonGroup({required this.name, required this.faces});
+
+  final String name;
+  final List<FacePerson> faces;
+
+  String get displayName => name.isEmpty ? "Unnamed" : name;
+}
+
+class _IdentityMatch {
+  const _IdentityMatch({required this.name, required this.score});
+
+  final String name;
+  final double score;
+}
+
+class _PeopleTab extends StatelessWidget {
+  const _PeopleTab({
+    required this.people,
+    required this.onOpenPerson,
+    required this.onEnroll,
+    required this.nameController,
+  });
+
+  final List<FacePerson> people;
+  final void Function(_PersonGroup group) onOpenPerson;
+  final Future<void> Function(String name) onEnroll;
+  final TextEditingController nameController;
+
+  List<_PersonGroup> _groupPeople() {
+    final Map<String, List<FacePerson>> grouped = <String, List<FacePerson>>{};
+    for (final FacePerson person in people) {
+      grouped.putIfAbsent(person.name, () => <FacePerson>[]).add(person);
+    }
+    final List<_PersonGroup> groups = grouped.entries.map((
+      MapEntry<String, List<FacePerson>> entry,
+    ) {
+      entry.value.sort(
+        (FacePerson a, FacePerson b) => b.createdAt.compareTo(a.createdAt),
+      );
+      return _PersonGroup(name: entry.key, faces: entry.value);
+    }).toList();
+    groups.sort(
+      (_PersonGroup a, _PersonGroup b) =>
+          b.faces.first.createdAt.compareTo(a.faces.first.createdAt),
+    );
+    return groups;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final List<_PersonGroup> groups = _groupPeople();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            const Text("People", style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.black12),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  const Text(
+                    "Enroll current face",
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: nameController,
+                    decoration: const InputDecoration(
+                      labelText: "Person name",
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  FilledButton(
+                    onPressed: () => onEnroll(nameController.text),
+                    child: const Text("Enroll from current face"),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              "Known people",
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 6),
+            if (groups.isEmpty)
+              const Text("No people enrolled yet.")
+            else
+              ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: groups.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 8),
+                itemBuilder: (BuildContext context, int index) {
+                  final _PersonGroup group = groups[index];
+                  final FacePerson cover = group.faces.first;
+                  return InkWell(
+                    onTap: () => onOpenPerson(group),
+                    borderRadius: BorderRadius.circular(12),
+                    child: Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(12),
+                        color: Colors.black.withValues(alpha: 0.03),
+                        border: Border.all(color: Colors.black12),
+                      ),
+                      child: Row(
+                        children: <Widget>[
+                          _PersonFaceThumb(bytes: cover.faceJpegBytes),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: <Widget>[
+                                Text(
+                                  group.displayName,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  "${group.faces.length} face${group.faces.length == 1 ? "" : "s"}",
+                                  style: const TextStyle(color: Colors.black54),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const Icon(Icons.chevron_right),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SettingsTab extends StatelessWidget {
+  const _SettingsTab({
+    required this.kpX,
+    required this.kiX,
+    required this.kdX,
+    required this.kpY,
+    required this.kiY,
+    required this.kdY,
+    required this.onPidChanged,
+    required this.serverUrl,
+    required this.urlController,
+    required this.onSaveServerUrl,
+  });
+
+  final double kpX;
+  final double kiX;
+  final double kdX;
+  final double kpY;
+  final double kiY;
+  final double kdY;
+  final void Function(
+    double kpX,
+    double kiX,
+    double kdX,
+    double kpY,
+    double kiY,
+    double kdY,
+  )
+  onPidChanged;
+  final String serverUrl;
+  final TextEditingController urlController;
+  final Future<void> Function(String url) onSaveServerUrl;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            const Text(
+              "Settings",
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 10),
+            _PidCard(
+              kpX: kpX,
+              kiX: kiX,
+              kdX: kdX,
+              kpY: kpY,
+              kiY: kiY,
+              kdY: kdY,
+              onChanged: onPidChanged,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              "Recognition server",
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 6),
+            TextField(
+              controller: urlController,
+              decoration: const InputDecoration(
+                labelText: "Server URL (e.g. https://host/api)",
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 6),
+            OutlinedButton(
+              onPressed: () => onSaveServerUrl(urlController.text),
+              child: Text(
+                serverUrl.isEmpty ? "Save server URL" : "Update server URL",
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PersonFaceThumb extends StatelessWidget {
+  const _PersonFaceThumb({required this.bytes});
+
+  final List<int>? bytes;
+
+  @override
+  Widget build(BuildContext context) {
+    if (bytes == null || bytes!.isEmpty) {
+      return Container(
+        width: 56,
+        height: 56,
+        decoration: BoxDecoration(
+          color: Colors.black12,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Icon(Icons.person, color: Colors.black45),
+      );
+    }
+    final Uint8List data = Uint8List.fromList(bytes!);
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: Image.memory(
+        data,
+        width: 56,
+        height: 56,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+      ),
+    );
+  }
+}
+
+class _PersonDetailPage extends StatefulWidget {
+  const _PersonDetailPage({
+    required this.isar,
+    required this.initialName,
+    required this.initialFaces,
+  });
+
+  final IsarService isar;
+  final String initialName;
+  final List<FacePerson> initialFaces;
+
+  @override
+  State<_PersonDetailPage> createState() => _PersonDetailPageState();
+}
+
+class _PersonDetailPageState extends State<_PersonDetailPage> {
+  late final TextEditingController _nameController;
+  late String _currentName;
+  List<FacePerson> _faces = <FacePerson>[];
+
+  @override
+  void initState() {
+    super.initState();
+    _currentName = widget.initialName;
+    _nameController = TextEditingController(text: _currentName);
+    _faces = List<FacePerson>.from(widget.initialFaces);
+  }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    super.dispose();
+  }
+
+  String get _displayName => _currentName.isEmpty ? "Unnamed" : _currentName;
+
+  Future<void> _reloadFaces() async {
+    final faces = await widget.isar.listPeopleByName(_currentName);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _faces = faces;
+    });
+  }
+
+  Future<void> _saveName() async {
+    final String next = _nameController.text.trim();
+    if (next == _currentName) {
+      return;
+    }
+    await widget.isar.renamePeople(_currentName, next);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _currentName = next;
+    });
+    await _reloadFaces();
+  }
+
+  Future<void> _deleteFace(FacePerson face) async {
+    await widget.isar.deletePerson(face.id);
+    await _reloadFaces();
+  }
+
+  Future<void> _deleteAllFaces() async {
+    await widget.isar.deletePeopleByName(_currentName);
+    if (!mounted) {
+      return;
+    }
+    Navigator.of(context).pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(_displayName)),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      const Text(
+                        "Person",
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _nameController,
+                        decoration: const InputDecoration(
+                          labelText: "Name",
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      FilledButton(
+                        onPressed: _saveName,
+                        child: const Text("Save name"),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: <Widget>[
+                  const Text(
+                    "Faces",
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const Spacer(),
+                  Text(
+                    "${_faces.length}",
+                    style: const TextStyle(color: Colors.black54),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              if (_faces.isEmpty)
+                const Text("No faces captured yet.")
+              else
+                GridView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: _faces.length,
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    crossAxisSpacing: 10,
+                    mainAxisSpacing: 10,
+                    childAspectRatio: 1,
+                  ),
+                  itemBuilder: (BuildContext context, int index) {
+                    final FacePerson face = _faces[index];
+                    return _FaceTile(
+                      bytes: face.faceJpegBytes,
+                      onDelete: () => _deleteFace(face),
+                    );
+                  },
+                ),
+              const SizedBox(height: 16),
+              OutlinedButton(
+                onPressed: _deleteAllFaces,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Theme.of(context).colorScheme.error,
+                ),
+                child: const Text("Delete person"),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _FaceTile extends StatelessWidget {
+  const _FaceTile({required this.bytes, required this.onDelete});
+
+  final List<int>? bytes;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final Widget image = bytes == null || bytes!.isEmpty
+        ? Container(
+            color: Colors.black12,
+            child: const Center(
+              child: Icon(Icons.person, color: Colors.black45),
+            ),
+          )
+        : Image.memory(
+            Uint8List.fromList(bytes!),
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+          );
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(14),
+      child: Stack(
+        fit: StackFit.expand,
+        children: <Widget>[
+          image,
+          Positioned(
+            top: 6,
+            right: 6,
+            child: IconButton(
+              onPressed: onDelete,
+              style: IconButton.styleFrom(
+                backgroundColor: Colors.black.withValues(alpha: 0.6),
+                foregroundColor: Colors.white,
+              ),
+              icon: const Icon(Icons.delete, size: 18),
+            ),
+          ),
+        ],
       ),
     );
   }

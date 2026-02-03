@@ -48,6 +48,8 @@ app.*.map.json
 *.onnx
 *.pt
 *.tflite
+*.data
 yolov8n-face_saved_model/
 calibration_image_sample_data_20x128x128x3_float32.npy
 .modelbuild/
+.venv_edgeface/

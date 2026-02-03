@@ -170,7 +170,7 @@ Takeaway:
 
 ## 8) Known Good Validation Signal
 
-In logcat (`InstaLinkTracker`), successful manual command should show:
+In logcat (`Insta360LinkTracker`), successful manual command should show:
 - `PTZ SET_CUR linux-captured wIndex=0x0100 ... rc=8`
 - followed by state event:
   - `PTZ command sent (linux tuple).`
