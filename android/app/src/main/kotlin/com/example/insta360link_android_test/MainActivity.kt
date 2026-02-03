@@ -29,6 +29,10 @@ import android.util.Log
 import android.util.Size
 import android.view.Surface
 import android.media.ImageReader
+import android.graphics.Rect
+import android.graphics.YuvImage
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -36,6 +40,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
@@ -75,10 +80,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private var imageReader: ImageReader? = null
     private var cameraFramesSinceReport = 0L
     private var cameraLastReportMs = 0L
+    private var previewWarmupUntilMs = 0L
     private var autoReconnectEnabled = true
     private var lastTargetVid = -1
     private var lastTargetPid = -1
     private var trackingEnabled = false
+    private var nativeTrackingActive = false
     private var yoloTracker: YoloV8FaceTracker? = null
     private var yoloInitFailureNotified = false
     private var lastInferenceMs = 0L
@@ -97,6 +104,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     private var patrolDirection = 1f
     private var lastPatrolCmdMs = 0L
     private var lastPatrolNoticeMs = 0L
+    private var lastPreviewLogMs = 0L
+    private var lastPreviewBoundsLogMs = 0L
+    private var previewRearmAttempted = false
+    private var previewGreenSinceMs = 0L
     private var pidKpX = -1.20f
     private var pidKiX = 0f
     private var pidKdX = -0.12f
@@ -269,6 +280,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
                 result.success(startTrackingPipeline())
             }
             "stopTracking" -> result.success(stopTrackingPipeline())
+            "pauseTracking" -> result.success(pauseTrackingPipeline())
             "setPid" -> {
                 val args = call.arguments as? Map<*, *>
                 val kpX = (args?.get("kpX") as? Number)?.toFloat() ?: 0f
@@ -325,6 +337,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             "activateCamera2" -> result.success(activateCameraWithCamera2())
             "reconnect" -> result.success(reconnectLastDevice())
             "getPreviewJpeg" -> result.success(getPreviewJpegFrame())
+            "dumpPreview" -> {
+                val ok = dumpPreviewToFile("/sdcard/Download/preview.jpg")
+                result.success(ok)
+            }
+            "recoverPreview" -> {
+                result.success(recoverPreviewSequence())
+            }
 
             "dispose" -> {
                 stopAndDetachUsb()
@@ -335,12 +354,295 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         }
     }
 
-    private fun getPreviewJpegFrame(): ByteArray? {
+    private fun getPreviewJpegFrame(ignoreWarmup: Boolean = false): ByteArray? {
         val format = nativeGetLatestFrameFormat()
-        if (format != 2) {
+        val w = nativeGetLatestFrameWidth()
+        val h = nativeGetLatestFrameHeight()
+        val frame = nativeGetLatestYuyvFrame()
+        if (!ignoreWarmup && System.currentTimeMillis() < previewWarmupUntilMs) {
             return null
         }
-        return nativeGetLatestYuyvFrame()
+        if (frame == null || w <= 0 || h <= 0) {
+            return null
+        }
+        val now = System.currentTimeMillis()
+        var path = "unknown"
+        if (format == 2) {
+            if (now - lastPreviewLogMs > 2000) {
+                lastPreviewLogMs = now
+                Log.i(tag, "preview raw fmt=2 len=${frame.size} head=${hexHead(frame, 12)}")
+            }
+            val direct = extractJpeg(frame)
+            if (direct != null) {
+                if (now - lastPreviewBoundsLogMs > 2000) {
+                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(direct, 0, direct.size, opts)
+                    lastPreviewBoundsLogMs = now
+                    Log.i(tag, "preview jpeg bounds=${opts.outWidth}x${opts.outHeight} bytes=${direct.size}")
+                }
+                val decoded = decodeJpegToBytes(direct)
+                if (decoded != null) {
+                    path = "mjpeg->reencode"
+                    if (now - lastPreviewLogMs > 2000) {
+                        lastPreviewLogMs = now
+                        Log.i(tag, "preview path=$path len=${decoded.size} fmt=$format size=${w}x${h}")
+                    }
+                    checkGreenAndRecover(decoded)
+                    return decoded
+                }
+                Log.w(tag, "Preview MJPEG decode returned null; trying YUYV fallback")
+            }
+            Log.w(tag, "Preview MJPEG decode failed len=${frame.size}; trying YUYV fallback")
+            val fallback =
+                yuyvToJpeg(frame, w, h, uyvy = false) ?: yuyvToJpeg(frame, w, h, uyvy = true)
+            if (fallback != null && now - lastPreviewLogMs > 2000) {
+                lastPreviewLogMs = now
+                path = "mjpeg->yuyv-fallback"
+                Log.i(tag, "preview path=$path len=${fallback.size} fmt=$format size=${w}x${h}")
+            }
+            if (fallback != null) {
+                checkGreenAndRecover(fallback)
+            }
+            return fallback
+        }
+        if (format == 1) {
+            val out = yuyvToJpeg(frame, w, h, uyvy = false) ?: yuyvToJpeg(frame, w, h, uyvy = true)
+            if (out != null && now - lastPreviewLogMs > 2000) {
+                lastPreviewLogMs = now
+                path = "yuyv"
+                Log.i(tag, "preview path=$path len=${out.size} fmt=$format size=${w}x${h}")
+            }
+            if (out != null) {
+                checkGreenAndRecover(out)
+            }
+            return out
+        }
+        return null
+    }
+
+    private fun hexHead(data: ByteArray, count: Int): String {
+        val limit = count.coerceAtMost(data.size)
+        val sb = StringBuilder()
+        for (i in 0 until limit) {
+            sb.append(String.format("%02X", data[i]))
+            if (i + 1 < limit) sb.append(" ")
+        }
+        return sb.toString()
+    }
+
+    private fun schedulePreviewRearmCheck() {
+        if (previewRearmAttempted) {
+            return
+        }
+        previewRearmAttempted = true
+        thread(name = "PreviewRearm", isDaemon = true) {
+            Thread.sleep(1600)
+            val jpeg = getPreviewJpegFrame(ignoreWarmup = true) ?: return@thread
+            if (!isLikelyGreenJpeg(jpeg)) {
+                return@thread
+            }
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"Preview looks green. Restarting UVC stream..."}""",
+            )
+            nativeStopTracking()
+            nativeTrackingActive = false
+            Thread.sleep(800)
+            val ok = nativeStartTracking()
+            nativeTrackingActive = ok
+            previewWarmupUntilMs = System.currentTimeMillis() + 1200
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"UVC stream restart ${if (ok) "done" else "failed"}."}""",
+            )
+        }
+    }
+
+    private fun isLikelyGreenJpeg(jpeg: ByteArray): Boolean {
+        val opts = BitmapFactory.Options().apply { inSampleSize = 16 }
+        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts) ?: return false
+        val w = bmp.width
+        val h = bmp.height
+        if (w <= 0 || h <= 0) return false
+        var rSum = 0L
+        var gSum = 0L
+        var bSum = 0L
+        var count = 0L
+        val stepX = max(1, w / 16)
+        val stepY = max(1, h / 12)
+        var y = 0
+        while (y < h) {
+            var x = 0
+            while (x < w) {
+                val c = bmp.getPixel(x, y)
+                rSum += (c shr 16) and 0xFF
+                gSum += (c shr 8) and 0xFF
+                bSum += c and 0xFF
+                count++
+                x += stepX
+            }
+            y += stepY
+        }
+        if (count == 0L) return false
+        val rAvg = rSum / count
+        val gAvg = gSum / count
+        val bAvg = bSum / count
+        return gAvg > 90 && rAvg < 30 && bAvg < 30 && gAvg > (rAvg + bAvg) * 2
+    }
+
+    private fun checkGreenAndRecover(jpeg: ByteArray) {
+        val now = System.currentTimeMillis()
+        if (isLikelyGreenJpeg(jpeg)) {
+            if (previewGreenSinceMs == 0L) {
+                previewGreenSinceMs = now
+            }
+            val greenForMs = now - previewGreenSinceMs
+            if (greenForMs > 2500 && !previewRearmAttempted) {
+                previewRearmAttempted = true
+                thread(name = "PreviewAutoRecover", isDaemon = true) {
+                    dispatchNativeEvent(
+                        "state",
+                        """{"status":"ready","message":"Preview still green. Auto-recovering..."}""",
+                    )
+                    recoverPreviewSequence()
+                }
+            }
+        } else {
+            previewGreenSinceMs = 0L
+            previewRearmAttempted = false
+        }
+    }
+
+    private fun recoverPreviewSequence(): Boolean {
+        return try {
+            nativeStopTracking()
+            nativeTrackingActive = false
+            Thread.sleep(300)
+            nativeInit()
+            Thread.sleep(300)
+            val device = usbManager.deviceList.values.firstOrNull { isLikelyUvcDevice(it) }
+            if (device != null) {
+                connectUsbDevice(device.vendorId, device.productId)
+            }
+            Thread.sleep(400)
+            val ok = activateCameraStreamInterface()
+            previewWarmupUntilMs = System.currentTimeMillis() + 1500
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"Recovery sequence finished (activate=$ok)."}""",
+            )
+            ok
+        } catch (t: Throwable) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"Recovery failed: ${t.message ?: "unknown"}"}""",
+            )
+            false
+        }
+    }
+
+    private fun dumpPreviewToFile(path: String): Boolean {
+        val data = getPreviewJpegFrame(ignoreWarmup = true) ?: return false
+        return try {
+            val file = java.io.File(path)
+            file.outputStream().use { it.write(data) }
+            dispatchNativeEvent(
+                "state",
+                """{"status":"ready","message":"Preview dumped to $path (${data.size} bytes)."}""",
+            )
+            true
+        } catch (t: Throwable) {
+            dispatchNativeEvent(
+                "state",
+                """{"status":"error","message":"Dump preview failed: ${t.message ?: "unknown"}"}""",
+            )
+            false
+        }
+    }
+
+
+    private fun extractJpeg(frame: ByteArray): ByteArray? {
+        var start = -1
+        var end = -1
+        var i = 0
+        while (i + 1 < frame.size) {
+            if (start < 0 && frame[i] == 0xFF.toByte() && frame[i + 1] == 0xD8.toByte()) {
+                start = i
+                i += 2
+                continue
+            }
+            if (start >= 0 && frame[i] == 0xFF.toByte() && frame[i + 1] == 0xD9.toByte()) {
+                end = i + 2
+                break
+            }
+            i++
+        }
+        if (start >= 0) {
+            val sliceEnd = if (end > start) end else frame.size
+            return frame.copyOfRange(start, sliceEnd)
+        }
+        return null
+    }
+
+    private fun decodeJpegToBytes(jpeg: ByteArray): ByteArray? {
+        val bitmap =
+            BitmapFactory.decodeByteArray(
+                jpeg,
+                0,
+                jpeg.size,
+                BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 },
+            ) ?: return null
+        val out = ByteArrayOutputStream()
+        val ok = bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
+        return if (ok) out.toByteArray() else null
+    }
+
+    private fun yuyvToJpeg(
+        yuyv: ByteArray,
+        width: Int,
+        height: Int,
+        uyvy: Boolean,
+    ): ByteArray? {
+        val frameSize = width * height
+        val nv21 = ByteArray(frameSize + frameSize / 2)
+        var yIndex = 0
+        var uvIndex = frameSize
+        var i = 0
+        for (row in 0 until height) {
+            val rowIsEven = (row and 1) == 0
+            var col = 0
+            while (col < width && i + 3 < yuyv.size) {
+                val y0: Int
+                val y1: Int
+                val u: Int
+                val v: Int
+                if (uyvy) {
+                    u = yuyv[i].toInt() and 0xFF
+                    y0 = yuyv[i + 1].toInt() and 0xFF
+                    v = yuyv[i + 2].toInt() and 0xFF
+                    y1 = yuyv[i + 3].toInt() and 0xFF
+                } else {
+                    y0 = yuyv[i].toInt() and 0xFF
+                    u = yuyv[i + 1].toInt() and 0xFF
+                    y1 = yuyv[i + 2].toInt() and 0xFF
+                    v = yuyv[i + 3].toInt() and 0xFF
+                }
+                nv21[yIndex++] = y0.toByte()
+                if (col + 1 < width) {
+                    nv21[yIndex++] = y1.toByte()
+                }
+                if (rowIsEven && uvIndex + 1 < nv21.size) {
+                    nv21[uvIndex++] = v.toByte()
+                    nv21[uvIndex++] = u.toByte()
+                }
+                i += 4
+                col += 2
+            }
+        }
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = ByteArrayOutputStream()
+        val ok = yuvImage.compressToJpeg(Rect(0, 0, width, height), 70, out)
+        return if (ok) out.toByteArray() else null
     }
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -537,6 +839,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         isCameraActive = false
         currentPanAbs = 0
         currentTiltAbs = 0
+        lastFaceW = 0.0f
+        lastFaceH = 0.0f
         lastFaceMotionMs = 0L
         patrolMode = false
         patrolDirection = 1f
@@ -622,6 +926,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
             "dumpxu" -> dumpExtensionUnits()
             "probexu" -> runXuProbeSweep()
             "replaylinux" -> replayLinuxBaselinePtz()
+            "dumpPreview" -> dumpPreviewToFile("/sdcard/Download/preview.jpg")
         }
     }
 
@@ -939,21 +1244,18 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
     }
 
     private fun startTrackingPipeline(): Boolean {
-        val nativeStreamOk = activateCameraStreamInterface()
-        if (!nativeStreamOk) {
-            dispatchNativeEvent(
-                "state",
-                """{"status":"error","message":"Native UVC stream activation failed. Cannot run libuvc tracking."}""",
-            )
-            return false
-        }
-        val nativeTrackerOk = nativeStartTracking()
-        if (!nativeTrackerOk) {
-            dispatchNativeEvent(
-                "state",
-                """{"status":"error","message":"Native tracking worker failed to start."}""",
-            )
-            return false
+        Thread.sleep(250)
+        if (!nativeTrackingActive) {
+            val nativeTrackerOk = nativeStartTracking()
+            if (!nativeTrackerOk) {
+                dispatchNativeEvent(
+                    "state",
+                    """{"status":"error","message":"Native tracking worker failed to start."}""",
+                )
+                return false
+            }
+            nativeTrackingActive = true
+            isCameraActive = true
         }
         if (ensureYoloTracker() == null) {
             trackingEnabled = false
@@ -982,6 +1284,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         filteredTilt = 0f
         mainHandler.removeCallbacks(yoloPollRunnable)
         mainHandler.post(yoloPollRunnable)
+        previewWarmupUntilMs = System.currentTimeMillis() + 1500
+        previewRearmAttempted = false
+        schedulePreviewRearmCheck()
 
         val msg =
             "Tracking started (libuvc YUYV + YOLOv8n-face + gimbal)."
@@ -1005,7 +1310,28 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         lastPatrolCmdMs = 0L
         lastPatrolNoticeMs = 0L
         nativeStopTracking()
+        nativeTrackingActive = false
+        previewRearmAttempted = false
         dispatchNativeEvent("state", """{"status":"connected","message":"Tracking stopped."}""")
+        return true
+    }
+
+    private fun pauseTrackingPipeline(): Boolean {
+        trackingEnabled = false
+        mainHandler.removeCallbacks(yoloPollRunnable)
+        errIntX = 0f
+        errIntY = 0f
+        filteredPan = 0f
+        filteredTilt = 0f
+        lastFaceMs = 0L
+        lastFaceW = 0.0f
+        lastFaceH = 0.0f
+        lastFaceMotionMs = 0L
+        patrolMode = false
+        patrolDirection = 1f
+        lastPatrolCmdMs = 0L
+        lastPatrolNoticeMs = 0L
+        dispatchNativeEvent("state", """{"status":"connected","message":"Tracking paused (manual mode)."}""")
         return true
     }
 
@@ -1278,7 +1604,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler, EventCh
         }
         val chars = cameraManager.getCameraCharacteristics(pickedId)
         val cfg = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val size = cfg?.getOutputSizes(ImageFormat.YUV_420_888)?.maxByOrNull { it.width * it.height } ?: Size(640, 480)
+        val sizes = cfg?.getOutputSizes(ImageFormat.YUV_420_888)?.toList() ?: emptyList()
+        val size =
+            sizes.firstOrNull { it.width == 1280 && it.height == 720 }
+                ?: sizes.firstOrNull { it.width == 640 && it.height == 480 }
+                ?: sizes.minByOrNull { it.width * it.height }
+                ?: Size(640, 480)
         stopCamera2Pipeline()
         startCameraThread()
         val handler = cameraHandler

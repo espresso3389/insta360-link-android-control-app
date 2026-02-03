@@ -61,6 +61,13 @@ class InstaLinkTracker {
     return result ?? false;
   }
 
+  Future<bool> pauseTracking() async {
+    final bool? result = await _methodChannel.invokeMethod<bool>(
+      "pauseTracking",
+    );
+    return result ?? false;
+  }
+
   Future<bool> setPid({
     required double kpX,
     required double kiX,
@@ -138,6 +145,16 @@ class InstaLinkTracker {
       "getPreviewJpeg",
     );
     return data;
+  }
+
+  Future<bool> dumpPreview() async {
+    final bool? result = await _methodChannel.invokeMethod<bool>("dumpPreview");
+    return result ?? false;
+  }
+
+  Future<bool> recoverPreview() async {
+    final bool? result = await _methodChannel.invokeMethod<bool>("recoverPreview");
+    return result ?? false;
   }
 
   Future<bool> dispose() async {

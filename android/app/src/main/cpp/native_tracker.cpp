@@ -212,10 +212,10 @@ bool start_uvc_stream_locked() {
         const char * label;
     };
     const Attempt attempts[] = {
-        {UVC_FRAME_FORMAT_YUYV, 640, 480, 30, "yuyv_480p30"},
-        {UVC_FRAME_FORMAT_MJPEG, 1920, 1080, 30, "mjpeg_1080p30"},
-        {UVC_FRAME_FORMAT_MJPEG, 1280, 720, 30, "mjpeg_720p30"},
         {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, "mjpeg_480p30"},
+        {UVC_FRAME_FORMAT_MJPEG, 1280, 720, 30, "mjpeg_720p30"},
+        {UVC_FRAME_FORMAT_MJPEG, 1920, 1080, 30, "mjpeg_1080p30"},
+        {UVC_FRAME_FORMAT_YUYV, 640, 480, 30, "yuyv_480p30"},
         {UVC_FRAME_FORMAT_ANY, 640, 480, 30, "any_480p30"},
     };
 
