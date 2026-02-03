@@ -4,3 +4,7 @@
 [submodule "third_party/libuvc"]
 	path = third_party/libuvc
 	url = https://github.com/libuvc/libuvc.git
+[submodule "third_party/edgeface"]
+	path = third_party/edgeface
+	url = https://github.com/otroshi/edgeface
+	branch = main
